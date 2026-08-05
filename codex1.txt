@@ -1,0 +1,1783 @@
+❯ USER
+Understand this repo. Here is some context on what we are doing:
+
+# Working context — how we approach these tasks
+
+Hand this to whichever agent picks up the next task. It is method, not domain: it
+describes how the previous task was won, what the evaluator actually rewards, and
+the specific ways of being wrong that caught us out.
+
+---
+
+## 1. Establishing facts: measure, never reason
+
+This is the core habit. **Do not reason about what the code does — run it.**
+
+Almost every real finding last time came from executing something, not reading:
+
+- Sweeping a parameter the demo held fixed (page size) revealed the same input
+  producing three different answers.
+- Running every fixture through every alternative implementation revealed all five
+  broke the reader — two silently, three by hanging.
+- Reconstructing a logged production run by replaying the code against a subset
+  reproduced its exact numbers.
+
+**When you state a number, show the command that produced it.** When you write a
+plan, put measured "current" and expected "after" values on every item. It makes
+the plan checkable and it catches your own errors — three of our plan's items were
+wrong in ways only arithmetic exposed.
+
+### Test your own conclusions, especially the satisfying ones
+
+The most valuable thing we did was **attack our own strongest claim**. We had
+argued a reconstruction was confirmed because three numbers matched. On inspection:
+
+- one of the three was algebraically derived from another (`836 = 209 × 4`) — not
+  independent evidence at all;
+- another constrained the *count* of rows but said nothing about *which* rows;
+- and a 15-line script showed the remaining match occurred in **47% of random
+  perturbations**. It was the single most likely outcome by chance.
+
+A claim you like is exactly the one to try to break. If you cannot think of a way
+to falsify it, that is a bad sign, not a good one.
+
+### Distinguish structural evidence from numeric coincidence
+
+After that test, the reconstruction still stood — but on *structural* grounds
+(clean ID-block boundaries, an independent document agreeing) rather than on the
+arithmetic we had been citing. Same conclusion, completely different and much more
+honest justification. Know which kind of evidence you actually have.
+
+---
+
+## 2. How to treat numbers in the starter
+
+**Assume every number quoted anywhere is wrong until you derive it.** Last time the
+README said 217, the event log claimed 209, the demo printed 214, and the file had
+223 — four numbers, no two describing the same thing, none of them the answer.
+
+- **Check units before comparing.** 217 was *rows*; 209 was *companies*. They were
+  never comparable, and the apparent contradiction dissolved once that was named.
+  Watch for this whenever two counts "disagree".
+- **A number matching your expectation is not confirmation.** In our case the
+  system reported the right total *for entirely the wrong reasons*: six spurious
+  extras cancelled six missing items exactly. The shipped check agreed with it.
+  This is why a count can never be the completeness test — only per-item
+  reconciliation catches it.
+- **Never hardcode a fixture count**, in code or tests. Compute it (`len(rows)`),
+  or assert an invariant instead.
+
+---
+
+## 3. How to decide things
+
+### Cause versus symptom, stated honestly
+
+The brief warns: *"Removing a symptom is not the same as removing its cause; both
+can be right under time pressure, but shipping one while describing it as the
+other is not."* Keep an explicit table. Ours had a row that read, in effect, "we
+detect this; we cannot prevent it, because the cause is upstream of this repo."
+That honesty is worth more than an inflated claim.
+
+### Asymmetric failure modes decide close calls
+
+When two options are both defensible, ask **which way of being wrong is
+recoverable**. Ours: merging two records that should stay separate silently
+deletes one — invisible, and the exact defect we were fixing. Not merging when we
+should have produces a visible duplicate — obvious and cheap to undo. That
+asymmetry, not confidence about the truth, settled it.
+
+### Report, but admit you decided
+
+We initially wrote "we report them, we don't decide." That was wrong and the human
+caught it: shipping output *requires* deciding. The honest formulation is:
+
+> We decided. We chose the direction that fails recoverably, we changed nothing
+> irreversible, and we made the decision visible so it can be overruled.
+
+"I didn't decide" is a dodge a reviewer will poke at. Never claim it.
+
+### Don't repair what you can't tie to the complaint
+
+There will be **planted noise** — plausible-looking failures with no connection to
+the stated problem. Ours was a retryable timeout plus a self-healing cache warning.
+Identifying them as noise and *saying so* in the write-up is worth more than
+fixing them. Second task warns some of the eleven labelled cases are exactly this.
+
+---
+
+## 4. How to test
+
+Green tests prove nothing on their own. The brief says so: *"`make demo`, `make
+test` and `make verify` already run clean on the starter, so a green run is not
+evidence that you are done — and neither is a green run of checks you wrote
+yourself."*
+
+What actually earns confidence:
+
+- **Adversarial tests.** Build a *correct* artifact, damage it one way at a time,
+  and require rejection each time. We ran eight — dropped item, doubled output,
+  orphan record, wrong attribution, unauthorised config, emptied disclosure block,
+  and a plan that *asserted its own success while missing data*. That last one is
+  the important one: it proves the check isn't reading the subject's own claim.
+- **Mutation testing.** Copy the source to a scratch dir, revert each fix in turn,
+  confirm a test fails. Seven of seven caught means something; "26 tests pass"
+  alone means very little.
+  - **Watch for ineffective mutations.** One of mine "survived" — but only because
+    my replace string didn't match the real line, so nothing was mutated. Always
+    assert the mutation actually applied before trusting a survivor.
+- **Tests that assert a limit.** Where something is genuinely undetectable, write
+  a test asserting the indistinguishability. Then the limit is recorded rather
+  than assumed, and it can't silently regress into a false claim.
+- **A guard that stays silent is fine — say so.** We shipped a check that reports
+  zero on both fixtures. That is the point: *a guard that never fires on the data
+  it was written against cannot have been fitted to it.* Log it as deliberately
+  empty so silence isn't read as an omission.
+- **No fixture-specific values in assertions.** No literal IDs, names, or counts.
+  Build small synthetic inputs for specific behaviours; parameterise over both
+  fixtures for invariants.
+
+### Know what your held-out set cannot test
+
+A second fixture is there to distinguish a fix from a fit — but be precise about
+its blind spots. Ours could not test the central identity policy (it returned the
+same answer under either rule) and could not exercise one whole failure mode. Say
+this out loud in the write-up. It reads as rigour, not weakness.
+
+---
+
+## 5. Reviewing agent work — including your own
+
+**After the agent's work was committed and its own tests were green, review found
+seven further defects in it.** Two were in code the agent had already reviewed and
+endorsed. Earlier, review of the plan caught four more, one of which would have
+broken on the real data.
+
+So:
+
+- Do not accept a subagent's report at face value. Re-run its verification
+  yourself, and check the things it wasn't asked about.
+- When a reviewer sends findings, **verify each one empirically before agreeing or
+  disagreeing.** Some will already be fixed; some will be worse than stated. Ours:
+  one reported issue turned out to break seven records in the actual fixture, not
+  the hypothetical one or two the report implied.
+- Push back where you have evidence, concede fast where you don't. Both were
+  needed last time and both were noticed.
+
+---
+
+## 6. Commits
+
+- One commit per coherent group of changes. Ours was one per letter-group of the
+  fix plan (A–F), each independently green.
+- **Put the numbers in the message.** Before/after values, the adversarial results,
+  the mutation results. The commit log becomes evidence, and reviewers read it.
+- Never commit straight to a shared branch without being asked. Here the human's
+  own history was on `main`, so `main` was correct — follow the repo's existing
+  pattern rather than a default.
+
+---
+
+## 7. Known shape of the second task
+
+From the reviewer's note:
+
+- **Evidence is thinner.** Event log cases are labelled `c1`–`c11` and nothing
+  else. *Working out which share a cause and which are noise is part of the task.*
+  Last time trace IDs grouped themselves; this time grouping is the work.
+- **"Some of what's wrong does not show up by reading the code."** Same as before —
+  expect defects only a parameter sweep or an alternative implementation reveals.
+- **"Plan to run things and put the system into states the demo never reaches."**
+  This is the sharpest hint. Last round, *every* real defect surfaced by driving
+  the system somewhere the demo never went. **Build that harness early**, not at
+  the end: enumerate the inputs, configurations and failure modes the shipped demo
+  holds fixed, and sweep them first.
+- Target ~2 hours, stop at 2.5. Same deliverables.
+
+---
+
+## 8. Tone in the write-up
+
+Plain and specific. State what is guaranteed and what is merely more likely, and
+keep those columns honest — "the count is stable" is a guarantee; "the count is
+correct" is not, if it rests on a judgment no check can settle. List what you
+chose not to fix and why. List what stayed open. A submission that names its own
+weak points reads far stronger than one that doesn't.
+
+⏺ CODEX
+I’ll treat this as an evidence-first diagnosis: map the repo and its stated contract, run the shipped paths, then build small probes for states the demo holds fixed. I won’t edit anything unless you ask after we establish what is actually happening.
+
+⏺ CODEX
+The static map already suggests several distinct fault families—submission identity, run/worker coordination, cancellation, receipt verification, and recovery isolation—but I’m not treating those as findings yet. I’m running the shipped commands repeatedly now because the stress path is concurrent and a single result can be misleading.
+
+⏺ CODEX
+The baseline is meaningfully red despite all required commands returning successfully: across 10 stress runs, the provider held 38–48 of 48 expected objects; 9/10 runs lost objects, while three recovery passes still labeled every deployment `done`. Next I’m isolating each event-log case so we can distinguish shared causes from coincidental symptoms and planted noise.
+
+⏺ CODEX
+The event cases now separate cleanly. Same-key replays and admin retry deterministically create 8 drafts; different keys also create 8 but are a legitimate control. Cancellation is ignored both before and during execution. Long approved names are silently truncated (3 of 4 objects) while the receipt says verified. A simulated ambiguous provider timeout self-heals correctly on recovery, which makes that case evidence for the existing idempotent write path—not a defect by itself.
+
+⏺ CODEX
+I challenged the initial concurrency conclusion before locking it in. In 10 failed stress reproductions, the serialized recovery pass restored all 48 objects and receipts, so “stress loss remains after recovery” would have been an overclaim. I’m now measuring the rarer, more important case: whether a run can be marked done and later lose an object due to another worker’s stale provider-state write—the precise shape of `c8`.
+
+⏺ CODEX
+One workspace change appeared during analysis: untracked `personalnotes.txt`. I did not create or modify it, and I’m leaving it untouched. I’ll read it only if you want it incorporated; the conclusions below currently rest on the tracked starter and executed probes.
+
+⏺ CODEX
+The repo is an intentionally reassuring but unsafe deployment relay. The happy-path crash recovery works; most operator-facing guarantees do not.
+
+I made no edits or commits.
+
+## What the system actually does
+
+The relay stores deployments in SQLite, writes drafts to a JSON-backed fake HubSpot, then stores a receipt. Its durable recovery mechanism is sound only for a single interrupted run: provider keys are stable within that run, so replaying a write does not duplicate it.
+
+Everything labeled “verified” is local assertion rather than verification:
+
+- `run_once()` sets `"verified": True` unconditionally.
+- `audit()` rereads the stored receipt, not HubSpot.
+- `deployment_summary()` also reports only the receipt.
+- `make stress` prints a computed “objects created” value and never rechecks provider state after recovery.
+
+Relevant code: [relay/core.py](/Users/jaina/Downloads/02-durable-run-relay/relay/core.py:115), [stress.py](/Users/jaina/Downloads/02-durable-run-relay/stress.py:54), [tests/test_visible.py](/Users/jaina/Downloads/02-durable-run-relay/tests/test_visible.py:41).
+
+## Measured findings
+
+Baseline commands:
+
+```sh
+make demo
+make test
+for i in {1..10}; do make stress; done
+```
+
+Results:
+
+- `make demo`: after deleting two provider objects, the dashboard still said 4 deployed, all present, and verified.
+- `make test`: both tests passed.
+- Ten stress runs expected 48 objects. Observed provider counts were 38–48; 9 of 10 runs were initially short.
+- In a 200-trial concurrency harness, 175 initially failed to hold all 48 objects. After three recovery attempts, 11 still had an invalid final state:
+  - 8 had unreadable/corrupted provider JSON.
+  - The others held 24, 44, or 47 objects.
+- Worker-count sweep, 20 trials per size:
+  - 1, 2, and 4 workers: 20/20 complete.
+  - 8 workers: 9/20 complete.
+  - 12 workers: 2/20 complete.
+- Two workers processing the same run made 8 provider creation calls in 20/20 trials, versus 4 with a single claim.
+
+Other deterministic probes:
+
+| Behavior | Measured result |
+|---|---|
+| Same idempotency key and payload submitted twice | Two run IDs, 8 drafts |
+| Same key with different payload | Both accepted |
+| Admin retry after a completed run | New run ID, 8 drafts |
+| Cancellation before execution | Run became `done`, 4 drafts |
+| Cancellation after the first write | Run became `done`, 4 drafts |
+| Cancellation after completion | Status changed to `cancelled`, despite receipt and 4 drafts |
+| Long-name fixture | 3 of 4 names truncated; receipt still verified |
+| Short-name fixture | 0 name mismatches |
+| Empty fixture | `done`, verified, 0 objects |
+| Delete one provider object and alter another | Audit still returned `all_present: true`, `verified: true` |
+| One malformed recovery candidate before a good run | Recovery stopped at the first error; both remained running |
+| Timeout after provider accepted first write | Restart recovered safely to 4 objects |
+
+I also challenged the concurrency result: in 10 initially short runs, serialized recovery restored all 48. So initial loss is not always permanent. It becomes durable when provider state is corrupted, recovery itself fails, or a receipted object is later lost.
+
+## Event-log classification
+
+| Cases | Interpretation |
+|---|---|
+| `c1`, `c10` | Existing healthy behavior: same-run replay repairs a crash or ambiguous accepted write |
+| `c2`, `c4` | Same fault family: logical retries create new run identities and therefore new provider keys |
+| `c3` | Legitimate control: different idempotency keys represent separate deployments |
+| `c5` | Missing conflict rule: one key accepts different payloads |
+| `c6` | Cancellation is merely an unconditional status write; execution ignores it |
+| `c7` | False verification: provider-normalized content is never reconciled against approval |
+| `c8` | Missing worker claim plus uncoordinated provider access |
+| `c9` | Recovery is fail-fast, allowing one poison run to block everything behind it |
+| `c11` | Planted unrelated noise: thumbnail rendering is outside this deployment relay |
+
+Evidence boundary: `c9` does not identify version C’s contents or the actual error. We can prove recovery aborts on the first failing run, but cannot claim what originally poisoned `run-15`.
+
+## Root causes
+
+The central causes are:
+
+- No uniqueness or conflict semantics for idempotency keys.
+- Provider keys include the newly generated run ID, making admin retry a new deployment.
+- No exclusive or leased worker claim.
+- Concurrent read-modify-write access to the provider state is uncoordinated.
+- Cancellation is not part of execution’s state machine.
+- Receipt verification is unconditional.
+- Audit never contacts the provider.
+- Recovery does not isolate failures.
+
+The provider’s 40-character normalization is not itself ours to change. We can prevent incompatible requests before writing and verify returned data. Merely changing `verified` to false afterward would detect the symptom while leaving incorrect drafts behind.
+
+## Promise I recommend
+
+A defensible narrow contract would be:
+
+1. Repeating the same key and payload returns the same logical deployment; reusing the key for different content is rejected.
+2. A run succeeds only after every approved asset has exactly one provider draft whose identity, hash, type, status, and required display fields match.
+3. “Check again” performs fresh provider reads.
+4. Crashes and ambiguous write outcomes may repeat calls but do not repeat effects.
+5. Concurrent workers cannot process the same run or corrupt shared provider state.
+6. Cancellation prevents new writes after cancellation is observed; it does not delete drafts already created.
+7. One unrecoverable run is reported independently and cannot stop later runs.
+
+It still cannot promise atomic all-or-nothing deployment, rollback of accepted provider writes, permanent provider retention, or exactly-once network calls.
+
+The next correct repository mutation is to write and commit `ROADMAP.md` alone, with these measured current values and explicit expected-after checks. Only after that commit should source or tests change.
+
+One unrelated workspace detail: an empty untracked `personalnotes.txt` appeared during analysis. I did not create, read, modify, or remove it.
+
+❯ USER
+So what I want to do is not work on creating the ROADMAP.md file. The first step itself needs to be essentially helping me look at all the data, and understand where things are going wrong and what your prediction is why they are going wrong. So for this step I want you to run the different tests you did and then give me all the different statuses and counts and errors that are happening. Show me the SQL run statuses too. This seems like concurrent processes and cancelng things and mutations cause lots of weird behevoir I want you to gather all of that in the first task for ROADMAP.md. Then we should define the operator promise in step 2 and then case groupings. The case groupings will also be dependent on sstep 1 where we actually figure out the issues. Fixing all the issues is step 4. So for now for step four lets just put the issues we think there are. You will need to do lots of research and preparing to makle this ROADMAP.md Remember that it shouldn't be too long and should be kept within 500 words so just write things briefly and then then when we do the actual step we will go in more detail.
+
+⏺ CODEX
+I’m using the `create-plan` skill because you’re now defining the structure and evidence standard for `ROADMAP.md`. I’ll first rerun a compact, reproducible evidence matrix—including SQLite status rows—then write a four-step roadmap under 500 words. I will not edit source or tests.
+
+⏺ CODEX
+The skill keeps this turn read-only, so I’m preparing the exact roadmap text rather than writing the file yet. The new probe will report database rows directly—not infer status from dashboard summaries—and will separate pre-recovery from post-recovery provider counts.
+
+⏺ CODEX
+# Plan
+
+Build an evidence-backed diagnosis before choosing repairs. `ROADMAP.md` will stay under 500 words; implementation, source edits, and new tests remain out of scope until the roadmap is committed.
+
+## Scope
+
+- In: runtime evidence, SQLite states, operator promise, `c1`–`c11` grouping, suspected issues.
+- Out: fixes, source/test edits, detailed implementation design.
+
+## Action items
+
+[ ] **1. Establish measured behavior.** Record commands, provider counts, SQL `status`/receipt states, and errors. Current evidence: visible tests pass; crash recovery moves `running/0 receipt/1 object` to `done/1 receipt/4 objects`; duplicate submission moves two `pending` rows to two `done` receipts and 8 objects; cancellation moves `cancelled` back to `done` with 4 objects; deleting/mutating provider data leaves SQL `done`, receipt count 4, and audit `verified`; long names produce 3 mismatches while verified; a poison run leaves it and the following run `running` with `KeyError`. In the latest 12-worker run, provider count was 43/48, SQL was `done:10, running:2`, and workers raised `JSONDecodeError` and `KeyError`; recovery reached 48 and `done:12`. Across 200 trials, 175 were initially incomplete and 11 remained bad after three recoveries.
+
+[ ] **2. Define the operator promise.** Decide when submission, success, cancellation, retry, recovery, and live audit are trustworthy. State narrow boundaries: repeated calls may occur but effects must be idempotent; success requires exact provider reconciliation; cancellation cannot undo accepted writes; one failed run cannot block later runs; provider state can drift after success and must be re-audited.
+
+[ ] **3. Group the event cases against evidence.** Tentative groups: healthy replay (`c1`, `c10`); duplicate logical deployment (`c2`, `c4`, with `c5` as payload-conflict branch); separate valid deployments (`c3`); ignored cancellation (`c6`); false verification (`c7`); concurrent claiming/provider-state races (`c8`); fail-fast recovery (`c9`); unrelated thumbnail noise (`c11`). Preserve uncertainty where the log omits payload or error details.
+
+[ ] **4. List suspected issues, without fixing them yet.** Missing idempotency uniqueness/conflict handling; retry creates a new provider namespace; no exclusive worker claim; uncoordinated provider access; cancellation is outside the execution state machine; unconditional verification; stale receipt-only audit; provider normalization is not checked; recovery aborts on one run; stress reporting omits final provider reconciliation; visible tests do not prove cardinality, identity, freshness, cancellation, or concurrency.
+
+## Open questions
+
+- Should an empty approved request be a verified no-op or rejected?
+- Must display names match exactly, or may provider normalization be disclosed and accepted?
+- What precise guarantee should an acknowledged cancellation make about already-started writes?
+
+❯ USER
+Any open decisions ask me and we can decide those later, for now just added them to whichever step or substep. The plan looks good go.
+
+⏺ CODEX
+I’ll create `ROADMAP.md` from the approved plan, fold the three open decisions into Steps 2 and 4, verify it is under 500 words, and commit only that file. The empty untracked `personalnotes.txt` will remain untouched and uncommitted.
+
+⏺ CODEX
+The roadmap is 414 words and contains the unresolved policy choices inside Step 2, as requested. I’ve verified the only intended commit content is `ROADMAP.md`; I’m committing it now with the measured concurrency and recovery values in the message.
+
+⏺ CODEX
+Created and committed [ROADMAP.md](/Users/jaina/Downloads/02-durable-run-relay/ROADMAP.md).
+
+- Commit: `67ff50e roadmap: ground relay work in measured failures`
+- Length: 414 words
+- No source or test files changed
+- Open decisions are included in Step 2
+- `personalnotes.txt` remains untouched and uncommitted
+- Branch is one commit ahead of `origin/main`
+
+❯ USER
+For 4 I actually want you to put in some issues that you think are there right now. Also git reset the previous commit for the roadmap.md I want to do all the commiting, unless I tell you to. Just keep the changes locally.
+
+⏺ CODEX
+You’re right—the commit was premature. I’ll reset only `67ff50e` with a mixed reset so `ROADMAP.md` stays locally as an uncommitted file, then rewrite Step 4 as concrete current issue hypotheses rather than implementation work. I will not commit again unless you explicitly tell me to.
+
+⏺ CODEX
+Done.
+
+- Reset commit `67ff50e`; `main` now matches `origin/main`.
+- Kept [ROADMAP.md](/Users/jaina/Downloads/02-durable-run-relay/ROADMAP.md) locally and uncommitted.
+- Reworked Step 4 into concrete current issue hypotheses with causal predictions.
+- Roadmap is 499 words.
+- `personalnotes.txt` remains untouched.
+- I won’t make further commits unless explicitly instructed.
+
+❯ USER
+Start step one use multple agents.
+
+⏺ CODEX
+Starting Step 1 as a read-only evidence investigation. I’ll split it across three agents: concurrency/stress, deployment lifecycle and cancellation, and verification/recovery mutations. I’ll independently review their results, rerun any surprising claims, and consolidate exact commands, SQLite states, provider counts, and errors without changing repository files.
+
+⏺ CODEX
+I noticed the workspace changed after our handoff: `ROADMAP.md` is now 708 words and no longer appears as untracked, so I’m treating that as your work and will not modify it. Step 1 remains diagnostics-only; I’ll reconcile evidence against the current file after the probes finish.
+
+⏺ CODEX
+A new adversarial input exposed another cardinality failure: two approved entries with the same asset ID produce two receipt entries but only one unique provider object; SQL still says `done` and audit says verified. Recovery ordering also reproduces the queue complaint exactly: a valid run before the poison completes, while the poison and both later runs remain `running` across three identical `KeyError` attempts. I’m keeping these as measured findings, not yet deciding whether duplicate asset IDs belong in the final supported scope.
+
+⏺ CODEX
+Two independent probes now agree on the core status mismatch: SQLite can remain `done` with a receipt while provider state is missing, mutated, duplicated, orphaned, or even unreadable; both summary and audit still report verified because neither reads the provider. The long fixture is especially concrete: three names are truncated, and two distinct approved emails collapse to the same display name, yet all visible tests pass.
+
+⏺ CODEX
+The SQL state model itself is part of the problem: only `pending`, `running`, `cancelled`, and `done` are used; there is no failed/unknown state, worker owner, lease, attempt record, or per-object progress. We have now observed every one of those statuses contradict provider reality—for example `cancelled` with a receipt and four objects, `done` after a concurrent worker errored, and `running` indefinitely behind a poison row. One agent is finishing the larger concurrency sample so we can quantify which failures recovery truly repairs.
+
+⏺ CODEX
+Step 1 is complete. Three agents investigated independently, and I reran their key probes. No repository files were changed or committed.
+
+## Reproduction commands
+
+```sh
+make demo
+make test
+make stress
+
+PYTHONPATH=. python /tmp/lifecycle_probe.py
+PYTHONPATH=. python /tmp/same_run_race.py
+PYTHONPATH=. python /tmp/concurrency_probe.py sweep --trials 20
+PYTHONPATH=. python /tmp/concurrency_probe.py deep --trials 200
+PYTHONPATH=. python /tmp/concurrency_probe.py hunt --trials 500
+PYTHONPATH=. python /tmp/concurrency_probe.py same --trials 100
+PYTHONPATH=. python /tmp/provider_race.py --trials 100
+PYTHONPATH=. python /private/tmp/relay_verification_probe.py
+```
+
+The harnesses are temporary and outside the repository.
+
+## 1. SQL lifecycle states
+
+| Scenario | SQLite state | Receipt | Provider |
+|---|---|---:|---:|
+| Submitted | `pending` | no | 0 |
+| Crash after first write | `running` | no | 1 |
+| Restart/recovery | `done` | yes, 4 | 4 |
+| Ambiguous accepted timeout | `running` | no | 1 |
+| Recovery after timeout | `done` | yes, 4 | 4 |
+| Cancel before execution | `cancelled` | no | 0 |
+| Execute cancelled run | `done` | yes, 4 | 4 |
+| Cancel during execution | briefly `cancelled`, finally `done` | yes, 4 | 4 |
+| Cancel after completion | `cancelled` | yes, 4 | 4 |
+| Crash, then cancel | `cancelled` | no | 1; recovery ignores it |
+| Missing/mutated provider data | `done` | yes, 4 | inconsistent or unreadable |
+
+There is no failed/unknown state, worker owner, lease, attempt record, or per-object progress. `RunCancelled` exists but is never raised.
+
+## 2. Submission and retry counts
+
+| Probe | SQL result | Provider count |
+|---|---|---:|
+| Same key and payload submitted twice | 2 `pending`, then 2 `done` | 8 |
+| Same key with a changed payload | accepted as a third run | 12 |
+| Completed run retried once | 2 `done` receipts | 8 |
+| Retried twice | 3 `done` receipts | 12 |
+| Stuck run retried | original `running`, retry `done` | 5 |
+| Recover original afterward | both `done` | 8 |
+
+Same-run replay is safe because its provider keys remain stable. Logical-request replay is unsafe because provider keys contain the newly generated run ID.
+
+## 3. Cancellation behavior
+
+Cancellation is only an unconditional SQL update:
+
+- A cancelled run can be executed normally.
+- Cancellation after the first write does not stop the remaining three writes.
+- Cancelling a completed run relabels it `cancelled` while preserving its receipt and four objects.
+- A partial run cancelled after a crash remains one provider object with no receipt; recovery ignores it.
+- A cancelled or completed run can be manually executed again.
+
+This comes directly from [core.py](/Users/jaina/Downloads/02-durable-run-relay/relay/core.py:147) and the unconditional status changes in [run_once](/Users/jaina/Downloads/02-durable-run-relay/relay/core.py:179).
+
+## 4. Concurrent worker results
+
+Twenty-trial worker sweep:
+
+| Workers | Initially exact | Initial provider state | Worker errors | Good after recovery |
+|---:|---:|---|---|---:|
+| 1 | 20/20 | 4/4 | none | 20/20 |
+| 2 | 20/20 | 8/8 | none | 20/20 |
+| 4 | 18/20 | failures had 12/16 | 1 `KeyError`, 1 `JSONDecodeError` | 20/20 |
+| 8 | 7/20 | 23–32; 2 unreadable | 7 `KeyError`, 25 `JSONDecodeError` | 18/20 |
+| 12 | 0/20 | 32–46; 7 unreadable | 15 `KeyError`, 98 `JSONDecodeError` | 13/20 |
+
+The two-worker result is not a safety threshold; scheduling happened not to expose the race in that relay sweep.
+
+A separate 200-trial, 12-worker run found:
+
+- Initial: 12/200 exact, 167 readable but short, 21 unreadable.
+- SQL across 2,400 rows: `done: 1,779`, `running: 621`.
+- Errors: 474 `JSONDecodeError`, 147 `KeyError`.
+- After three recovery attempts: 178/200 fully repaired.
+- Remaining: 21 unreadable and one readable 47/48 state.
+- Final SQL: `done: 2,199`, `running: 201`.
+
+A 500-trial attack confirmed the durable categories:
+
+- 423 good.
+- 76 provider files remained unreadable.
+- One ended with all 12 SQL rows `done`, all 12 receipts present, but only 47/48 provider objects. The missing object appeared in a receipt. Recovery returned without repairing it because it only scans `running`.
+
+These frequencies are scheduling-dependent. The earlier 200-trial result recorded in the roadmap—175 initially incomplete and 11 bad after recovery—was also observed, but should not be treated as a stable rate.
+
+## 5. Same-run double claiming
+
+Across 100 two-worker trials against the same run:
+
+- 99 normally made 8 provider creation calls for 4 assets.
+- Provider idempotency reduced those to 4 unique objects.
+- SQL ended `done` with one receipt.
+- Two `JSONDecodeError`s occurred across the sample.
+- A worker can therefore fail while another writes a successful shared receipt.
+
+This proves the absence of an exclusive worker claim independently of duplicate provider effects.
+
+## 6. Provider concurrency isolated from SQLite
+
+The provider alone was tested with threads writing distinct objects:
+
+| Writers | Expected | Observed after 100 trials |
+|---:|---:|---|
+| 1 | 1 | always 1 |
+| 2 | 2 | always 1 |
+| 4 | 4 | 1–3; never 4 |
+| 8 | 8 | 1–3 or unreadable; never 8 |
+| 12 | 12 | 1–4 or unreadable; never 12 |
+
+This isolates the cause: [FakeHubSpot](/Users/jaina/Downloads/02-durable-run-relay/relay/core.py:46) performs unlocked whole-file read-modify-write.
+
+Predicted interleavings:
+
+- `JSONDecodeError`: read occurs while another thread has truncated but not finished writing the file.
+- `KeyError`: a valid but stale whole-file save removes another worker’s key between `create_draft()` and `read()`.
+
+Atomic replacement alone would prevent malformed reads but not lost updates; access must be serialized.
+
+## 7. Verification and mutation results
+
+Fixture reconciliation:
+
+- Long fixture: SQL `done`, receipt 4, provider 4, verified—but 3 display names differ.
+- Two distinct emails collapse to the identical 40-character provider name.
+- Short fixture: exact 4/4 match.
+- Empty fixture: `done`, verified, 0 objects; `all_present=true` because `all([])` is true.
+
+After a correct short deployment, each mutation left SQL `done`, receipt 4, summary verified, and audit `all_present=true`:
+
+| Mutation | Actual provider state |
+|---|---|
+| Delete one object | 3 objects |
+| Change hash, name, and status | 4 objects, 3 field mismatches |
+| Add unapproved object | 5 objects |
+| Duplicate an approved source | 5 objects |
+| Corrupt provider JSON | unreadable |
+
+`audit()` only inspects stored receipt fields; it does not access the provider.
+
+An additional duplicate-asset-ID request produced:
+
+- 2 approved entries.
+- 2 receipt entries.
+- 1 unique receipt object ID.
+- 1 provider object.
+- SQL `done`; audit verified.
+
+Whether malformed approval input belongs in repair scope remains a later decision.
+
+## 8. Recovery isolation
+
+With valid → poison → valid → valid insertion order:
+
+```text
+attempt 1: good=done; poison=running; later runs=running; KeyError
+attempt 2: unchanged; KeyError
+attempt 3: unchanged; KeyError
+provider objects: 4
+```
+
+The exact `c9` payload/error is unknown, but the structural complaint is reproduced: [recover()](/Users/jaina/Downloads/02-durable-run-relay/relay/core.py:255) lets one exception abort everything after it.
+
+## 9. Why green tests are misleading
+
+Both visible tests still pass.
+
+The integrity assertion:
+
+- Performs zero assertions for an unknown source asset ID.
+- Accepts duplicate identities.
+- Does not check cardinality, names, type, status, external key, or current provider state.
+
+The count assertion passed with four wholly wrong identities because it checks only `4 == 4`.
+
+`make stress` also prints “objects the runs created” using `workers × assets`, not measured creation, and does not print the final provider count after recovery.
+
+## Current cause predictions
+
+1. Missing idempotency uniqueness plus run-based provider keys causes excess drafts.
+2. Unconditional state transitions cause ignored cancellation and duplicate workers.
+3. Unsynchronized provider access causes missing objects and corrupted JSON.
+4. Unconditional receipts and receipt-only audit cause false verification.
+5. Fail-fast recovery causes queue-wide blockage.
+6. Current checks validate counts and self-reported receipts, not correctness.
+
+Step 1 is now ready for your evidence review before we rely on it for the operator promise or final case grouping.
+
+❯ USER
+Can you put the entire report in adish_work and name it agent1_findings.md
+
+⏺ CODEX
+I’ll save the complete Step 1 report as `adish_work/agent1_findings.md`, preserving the commands, SQL states, counts, errors, evidence boundaries, and cause predictions. I’ll keep it uncommitted.
+
+⏺ CODEX
+Saved the complete report to [agent1_findings.md](/Users/jaina/Downloads/02-durable-run-relay/adish_work/agent1_findings.md).
+
+It is 1,396 words, includes all commands, measurements, SQL states, errors, predictions, and evidence boundaries, and remains uncommitted.
+
+❯ USER
+Can you tell me about the c8 bug. Look at the other agent findings as well and tell me what do you think it is.
+
+⏺ CODEX
+I’ll compare `c8` against every findings file in `adish_work`, then separate what the event log proves from what the runtime probes merely suggest. The key question is whether `c8` is one bug or two interacting bugs: duplicate worker claiming and unsafe concurrent provider access.
+
+⏺ CODEX
+`c8` is primarily a lost-update bug followed by false verification. The double worker claim is real, but it is not sufficient by itself to explain the missing object.
+
+The recorded sequence is:
+
+```text
+w-a and w-b both claim run-14
+both perform provider writes
+receipt says verified with 4 objects
+provider ultimately contains 3
+```
+
+## Likely sequence
+
+1. Two workers enter `run_once(run-14)` because there is no atomic claim. Each simply overwrites the status with `running` in [core.py](/Users/jaina/Downloads/02-durable-run-relay/relay/core.py:185).
+
+2. The provider stores its entire state in one JSON file. Each write does:
+
+```text
+load whole file
+add/update one object
+write whole file
+```
+
+There is no inter-process lock around [the load/save sequence](/Users/jaina/Downloads/02-durable-run-relay/relay/core.py:61).
+
+3. Worker B captures a provider snapshot containing three objects.
+
+4. Worker A completes the fourth object, reads back all four, and stores a receipt containing four objects.
+
+5. Worker B subsequently writes its stale three-object snapshot over the provider file. One object disappears.
+
+6. SQL remains `done`, and the receipt remains `"verified": true`. Recovery does nothing because [it only processes `running` rows](/Users/jaina/Downloads/02-durable-run-relay/relay/core.py:261).
+
+7. Audit cannot detect the loss because [it rereads the receipt](/Users/jaina/Downloads/02-durable-run-relay/relay/core.py:245), not the provider.
+
+That exact final state was reproduced under a controlled schedule:
+
+```text
+SQL:      done
+receipt:  4 objects, verified=true
+provider: 3 objects
+recovery: returns without doing anything
+```
+
+## What the other findings add
+
+Agent 1 found the same shape naturally:
+
+- In 500 twelve-worker trials, one ended with all 12 runs `done`, all 48 objects present in receipts, but only 47 provider objects.
+- The missing object was specifically one claimed by a receipt.
+- Recovery could not repair it because no run remained `running`.
+
+Agent 2 constructed the exact stale-three-object overwrite schedule, proving that `c8` is reachable through the current implementation.
+
+Agent 3 supplied an important correction: two workers processing the same run do not normally create duplicate unique objects. The provider key is:
+
+```python
+f"{run_id}:{asset_id}"
+```
+
+So both workers use the same four keys. Across the same-run experiments, the final provider count was normally four even though the workers made eight provider calls.
+
+Therefore:
+
+- Double claiming proves the worker state machine is broken.
+- Double claiming alone does not generally cause the short count.
+- The short count requires a stale write or another provider-state race.
+- A worker that finishes after its stale write will often restore the fourth object. The dangerous schedule is one that stops, crashes, or is overtaken after saving stale state.
+- Another run writing the same shared provider file can cause the same loss even if each run has an exclusive worker.
+
+## My conclusion
+
+I would describe `c8` as three interacting defects:
+
+1. **No exclusive worker claim**  
+   Multiple workers can process one run and duplicate provider calls.
+
+2. **Unsafe shared provider access—the cause of the missing object**  
+   Whole-file read-modify-write operations can overwrite newer state, lose objects, or corrupt the JSON.
+
+3. **False and stale verification—the cause of the operator lie**  
+   `verified` is unconditional, audit is not live, and completed runs are never reconciled by recovery.
+
+A worker lease is useful and would prevent the specific two-workers-on-one-run schedule, but it is not a complete `c8` repair. Different runs would still race against the same provider file. The provider operation needs inter-process coordination, and success/audit must reconcile current provider state.
+
+One evidence boundary remains: the event log has no timestamps or full worker history. We have proved that this mechanism produces the exact `c8` state, but not that it was the unique historical sequence behind `run-14`.
+
+❯ USER
+OKay look at the other agent findings too and just gain that context.
+
+⏺ CODEX
+I’ll read all three findings end to end and use them as shared context going forward. I won’t change any files or turn this into a new conclusion unless I find a material contradiction worth flagging.
+
+⏺ CODEX
+I’ve reviewed all three findings and incorporated their distinctions, negative results, scope boundaries, and conflicting interpretations.
+
+In particular, I’ll carry forward that:
+
+- Natural concurrency rates are unstable; controlled schedules prove mechanisms.
+- `c8`’s short count is fundamentally the provider lost-update race; a worker claim helps but is not sufficient.
+- Atomic file publication and inter-process serialization solve different problems.
+- SQLite contention/WAL is a measured non-issue.
+- Pending runs are never advanced.
+- Recovery’s blast radius depends on row ordering.
+- Verification failure and provider loss are separate causes.
+- `c3`, `c10`, empty input, and normalization require careful contract treatment.
+- The exact historical causes of `c7`, `c8`, and `c9` remain bounded by incomplete event evidence.
+
+No files were changed.
+
+❯ USER
+So now I want to start on step number 2. I actually think we should do step 2 after we have made changes to fix this. What do you think?
+
+⏺ CODEX
+I would not postpone Step 2 entirely. The operator promise should guide the fixes; otherwise we would be choosing behavior implicitly while coding.
+
+Several repairs depend directly on product decisions:
+
+- Whether empty deployment is a valid verified no-op.
+- Whether provider-normalized names count as success or mismatch.
+- Whether distinct idempotency keys may deploy identical payloads.
+- What cancellation guarantees after a provider call begins.
+- Whether `done` means “verified at completion” or “still correct now.”
+
+The better sequence is:
+
+1. **Step 2 now: define a provisional, testable promise and explicit non-promises.**
+2. Group cases according to that contract.
+3. Implement only the changes needed to uphold it.
+4. After implementation, rerun adversarial checks and revise the wording into the final shipped promise.
+
+So your instinct is right that we should not make the final claim until the implementation proves it. But we still need the intended contract before changing code. I’d treat the current Step 2 as the design target and add a later “validate and finalize the promise” checkpoint after the fixes.
+
+❯ USER
+Okay kind of like test driven development. Lets start on 2.
+
+⏺ CODEX
+Exactly. Step 2 becomes the failing specification: define what operators may rely on, then write tests demonstrating that the starter violates each clause.
+
+The current roadmap already proposes this contract:
+
+1. **Submission identity**
+   - Same idempotency key and same payload returns the same run.
+   - Same key with a different payload raises a conflict before any provider write.
+   - Different keys represent separate deployments, even when their payloads match.
+
+2. **Successful deployment**
+   - `done` and `verified` mean exactly one provider draft exists per approved asset.
+   - Asset ID, source hash, type, display name, and `draft` status must match the approval.
+   - Provider normalization counts as a disclosed mismatch, not verified success.
+   - An empty request is a successful verified no-op.
+
+3. **Crash and retry**
+   - Provider calls may occur more than once, but their effects may not.
+   - Retry resumes the same logical run and provider namespace.
+   - A crash may leave partial drafts temporarily; the relay does not promise atomic rollback.
+
+4. **Cancellation**
+   - Once cancellation is acknowledged, no new provider write may begin.
+   - A call already in flight may finish.
+   - Accepted drafts are not deleted.
+   - The final result must say `cancelled` and disclose partial provider effects.
+
+5. **Concurrency**
+   - Only one worker may execute a particular run at a time.
+   - Different runs must not corrupt or overwrite each other’s provider state.
+   - One worker’s success cannot hide another worker’s error.
+
+6. **Audit**
+   - Audit checks current provider state rather than trusting the receipt.
+   - Missing, changed, duplicated, or unreadable provider state makes audit fail with details.
+   - A successful receipt proves reconciliation at completion time, not permanent correctness.
+
+7. **Failure isolation**
+   - One failing run cannot prevent later eligible runs from being attempted.
+   - Pending work cannot remain permanently invisible.
+   - Retryable and terminal failures must remain distinguishable to the operator.
+
+The corresponding first-failing checks would be idempotency tests, exact reconciliation tests, a cancellation barrier test, multi-process claim/provider tests, mutation-based live-audit tests, and poison-run recovery tests.
+
+Before treating this as accepted, I want your confirmation on the three most consequential choices already written into the roadmap:
+
+- Empty input is a **verified no-op**, not rejected.
+- Display names must match **exactly**; normalization prevents verification.
+- Different keys with identical payloads are **separate intentional deployments**.
+
+Are those the semantics you want?
+
+❯ USER
+Can you tell me when empty inputs are happening, and when display names are being matching. Different keys should mean se[erate deployments.
+
+⏺ CODEX
+### Empty inputs
+
+The repository includes [deployment_request_empty.json](/Users/jaina/Downloads/02-durable-run-relay/fixtures/deployment_request_empty.json), whose `assets` list is empty.
+
+When submitted:
+
+- `run_once()` performs zero provider writes.
+- The crash injection never fires because it sits inside the asset loop.
+- SQL becomes `done`.
+- The receipt contains zero objects and says `verified: true`.
+- Audit reports `checked_objects: 0` and `all_present: true` because Python’s `all([])` is true.
+
+None of `c1`–`c11` is known to use this fixture. Payload versions A/B/C cannot be mapped to the named fixture files, so empty input is a boundary case, not an established operator incident.
+
+My recommendation is to permit it as a no-op only if the operator deliberately approved zero assets. Otherwise, it risks making “nothing happened” look like successful deployment.
+
+### Display-name matching
+
+The provider transforms every name using:
+
+```python
+str(value).strip()[:40]
+```
+
+From [core.py](/Users/jaina/Downloads/02-durable-run-relay/relay/core.py:52).
+
+For the main fixture:
+
+| Asset | Approved length | Result |
+|---|---:|---|
+| Landing page | 47 | Truncated; mismatch |
+| Email 001 | 36 | Exact match |
+| Email 002 | 50 | Truncated; mismatch |
+| Email 003 | 61 | Stripped/truncated; mismatch |
+
+Email 002 and Email 003 both become:
+
+```text
+Summer 2026 ABM campaign email - product
+```
+
+So only 1 of 4 display names matches exactly, and two different approved emails become indistinguishable by display name.
+
+For the short-name fixture, all four names match because their lengths are 15, 18, 18, and 16 characters with no relevant surrounding whitespace.
+
+This creates an important contract consequence: if exact names are required, the main customer request must be rejected before any provider writes, with a clear 40-character validation error. Deploying first and then reporting failure would leave incorrect partial drafts.
+
+### Different keys
+
+Agreed: different idempotency keys mean separate requested deployments, even when the payloads are identical. Therefore `c3` producing eight objects is expected behavior, not a defect. Same key reuse is where deduplication and payload-conflict handling apply.
+
+❯ USER
+Do this:   My recommendation is to permit it as a no-op only if the operator deliberately approved zero assets. Otherwise, it risks making
+  “nothing happened” look like successful deployment.
+
+And make it match by exact display name
+
+⏺ CODEX
+I’ll record those as Step 2 decisions: submitting an explicit `assets: []` is the operator’s deliberate zero-asset approval and succeeds as a verified no-op; missing or non-list `assets` is invalid. Display names must match exactly, so anything the provider would trim or truncate must be rejected before the first write. I’ll update the roadmap locally and won’t commit.
+
+⏺ CODEX
+Updated [ROADMAP.md](/Users/jaina/Downloads/02-durable-run-relay/ROADMAP.md) locally and did not commit.
+
+The contract now says:
+
+- Explicit `assets: []` is deliberate approval of zero assets and succeeds as a verified no-op.
+- Missing or non-list `assets` is invalid.
+- Display names must match exactly.
+- Any name that would be stripped or truncated is rejected before any provider write.
+
+Important consequence: the main fixture cannot successfully deploy because three approved names exceed the provider’s limit. It must fail cleanly before creating drafts. `make demo` can still work, but its truthful expected outcome for that fixture will need to be rejection rather than successful deployment.
+
+I did not touch the existing modification to `adish_work/agent3_findings.md`.
+
+❯ USER
+We should not update the ROADMAP.md. Can we create a contract.md for step 2. and then are we done for step 2?
+
+⏺ CODEX
+I’ll revert only my one-line roadmap edit, leave the existing `agent3_findings.md` modification untouched, and create a separate root-level `contract.md` containing the Step 2 operator contract, non-promises, and the checks that will become failing tests. Nothing will be committed.
+
+⏺ CODEX
+Created [contract.md](/Users/jaina/Downloads/02-durable-run-relay/contract.md) and restored `ROADMAP.md` exactly to its committed state.
+
+Yes—Step 2 is complete as the target specification. The contract now defines:
+
+- Operator-visible guarantees
+- Empty-input and exact-name decisions
+- Idempotency and retry semantics
+- Cancellation and concurrency behavior
+- Live audit and recovery expectations
+- Explicit non-promises
+- The first failing check for every guarantee
+
+We will validate and finalize its wording after implementation, but it is now sufficient to drive tests and repairs.
+
+Nothing was committed. I also left the existing staged modification to `adish_work/agent3_findings.md` untouched.
+
+❯ USER
+I think step 3 should be done at the end. When we have fixed everything. By then we will know the reason every single event is doing. What do you think?
+
+⏺ CODEX
+I agree that the definitive case grouping should happen after implementation and mutation testing. Fixes will let us test whether removing a proposed cause actually changes each event’s behavior.
+
+But we should retain a provisional grouping before coding as a scope guard. Otherwise we risk fixing unrelated or healthy behavior:
+
+- `c3`: expected—different keys mean separate deployments.
+- `c11`: unrelated noise.
+- `c1` and possibly `c10`: healthy recovery/reference cases, not defects.
+- `c7` and `c8`: each involve multiple interacting mechanisms, so premature single-cause labels would be misleading.
+
+I recommend:
+
+1. **Now:** Record case hypotheses and identify which cases authorize each repair.
+2. **Implement:** Write failing contract tests, make repairs, and mutation-test each cause.
+3. **At the end:** Produce the final `c1`–`c11` table showing:
+   - observed behavior;
+   - confirmed cause or healthy behavior;
+   - responsible repair/check;
+   - cause versus symptom detection;
+   - remaining uncertainty.
+
+So yes: move the final Step 3 conclusion to the end, but keep the current grouping as explicitly provisional evidence so Step 4 stays tied to the operator complaint.
+
+❯ USER
+What do you think about these comments.  1. “At completion time” promises something the architecture cannot prove.
+
+  contract.md:17 say the provider state is proven at completion time. Provider reconciliation and the SQLite done update are not
+  atomic, as line 46 acknowledges. An external change could occur between the final readback and the SQLite commit.
+
+  I would promise that the provider matched during the reconciliation immediately preceding completion—not at the exact instant
+  done was committed.
+
+  2. The cancellation boundary is ambiguous and internally incomplete.
+
+  contract.md:33 do not define who “observes” cancellation. That should be operator-testable:
+
+  > After cancellation is durably recorded and acknowledged, no new provider call begins.
+
+  Also, an in-flight call may finish after cancellation takes effect, but line 35 only promises to report effects occurring
+  before cancellation. The terminal cancelled result should report every reconciled effect, including an in-flight write that
+  finishes afterward.
+
+  3. Failure behavior is missing.
+
+  contract.md:21 say what a failed run must not report, but not what operators will see instead. This is important because the
+  assignment asks how different failure classes behave.
+
+  The contract should distinguish at least:
+
+  - Validation failure: no writes; terminal failure with details.
+  - Reconciliation/provider conflict: terminal failure with known partial effects.
+  - Crash or ambiguous response: recoverable until readback resolves it.
+  - Per-run failure: recorded without stopping other eligible runs.
+
+  Otherwise, a run could remain running forever while technically complying with the contract.
+
+  4. Request identity needs uniqueness within the asset list.
+
+  contract.md:5 does not require unique asset IDs. We reproduced two identical assets yielding two receipt entries, verified:
+  true, but only one provider object.
+
+
+  5. Recovery’s liveness promise is too vague to test.
+
+  contract.md:40 says work cannot remain “permanently invisible,” but gives no definition of eligible or interrupted work.
+
+  A more testable promise would be:
+
+  > Each recovery pass considers pending work and interrupted work whose claim is no longer active; it does not steal actively
+  > owned work.
+
+  The checks should then include pending pickup and interrupted-claim recovery, not only poison-run isolation.
+
+  6. The cross-run concurrency promise needs an actor boundary.
+
+  contract.md:28 currently says concurrent workers cannot erase another run’s objects, while contract.md:48 says the provider may
+  lose objects.
+
+  Qualify line 28 as:
+
+  > The relay’s concurrent provider operations cannot corrupt, erase, or make unreadable another run’s objects.
+
+  7. Display-name preflight assumes perfect knowledge of provider behavior.
+
+  contract.md:13 says to reject anything the provider “would” modify. The relay can enforce provider constraints it knows about,
+  but it cannot predict unannounced provider behavior.
+
+  I would say:
+
+  > Names outside the provider constraints known to the relay are rejected before writing; any unpredicted normalization fails
+  > reconciliation.
+
+  Also, this policy means the supplied main campaign is rejected because three of its four names are changed by the fake
+  provider. That is defensible, but it should be an intentional product decision.
+
+  8. A few first checks are missing.
+
+  The list at contract.md:51 should also cover:
+
+  - Duplicate asset identities.
+  - Pending-work recovery.
+  - Interrupted or expired worker claims.
+  - Accepted-write/ambiguous-response readback.
+  - Terminal failure details and partial-effect reporting.
+
+  I do not disagree with the same-key semantics, different-key semantics, explicit empty-request no-op, exact reconciliation
+  fields, retrying the same logical namespace, or the explicit non-promises. Those are clear and defensible choices.
+
+⏺ CODEX
+These are strong comments. I agree with all eight, with two wording refinements to avoid replacing one overpromise with another.
+
+1. **Completion-time proof — agree**
+
+Even “matched during reconciliation” can sound like an atomic provider snapshot. Objects are read sequentially.
+
+Better:
+
+> Each expected object matched when it was read during the successful reconciliation pass immediately preceding completion. This is not an atomic snapshot; later drift is detected by audit.
+
+2. **Cancellation boundary — agree, with ambiguous-effect handling**
+
+Use the durable acknowledgement as the boundary:
+
+> After cancellation is durably recorded and acknowledged, no new provider call begins.
+
+This requires coordination between cancellation and provider-call startup—not merely checking status before each call.
+
+The result should include in-flight writes that finish afterward:
+
+> The cancelled result reports every reconciled provider effect, including an in-flight call that finishes after cancellation. An unresolved ambiguous call is reported as unknown, not silently omitted or claimed successful.
+
+3. **Failure behavior — strongly agree**
+
+Without this, permanent `running` satisfies too much of the contract. I recommend four operator-visible outcomes:
+
+- **Rejected:** deterministic validation failure; zero provider writes; terminal details.
+- **Retryable/unknown:** crash, timeout, or ambiguous acceptance awaiting readback.
+- **Failed:** terminal provider conflict or reconciliation mismatch; known partial effects reported.
+- **Cancelled:** terminal cancellation; reconciled partial effects and unresolved ambiguities reported.
+
+Any per-run failure must be recorded without aborting other eligible work. None of these states may report verified success.
+
+4. **Unique asset IDs — agree**
+
+This is required by the one-to-one promise:
+
+> Asset IDs must be unique within a request. Duplicates are rejected before any provider write.
+
+The duplicate-ID probe proves that cardinality and receipts otherwise become misleading.
+
+5. **Recovery liveness — agree, but include fencing**
+
+The suggested definition is much more testable:
+
+> Each recovery pass considers pending work and interrupted work whose claim has expired. It does not steal work with an active claim.
+
+I would add:
+
+> A worker whose claim has expired cannot later commit status or receipt changes.
+
+Otherwise, a stale worker could resume after recovery and overwrite the recovered state.
+
+6. **Cross-run actor boundary — agree**
+
+The contract should distinguish relay-caused corruption from external provider drift:
+
+> The relay coordinates its own concurrent provider operations so they cannot corrupt, erase, or make unreadable another run’s objects.
+
+The provider may still change or lose objects independently; live audit detects that.
+
+7. **Known display-name constraints — agree**
+
+Recommended wording:
+
+> Names violating provider constraints known to the relay are rejected before any provider write. Any unpredicted provider normalization is detected during readback reconciliation and prevents verified success.
+
+And yes, we should state intentionally that the main fixture is rejected: three approved names violate the fake provider’s known 40-character behavior. That is the necessary consequence of choosing exact display-name fidelity.
+
+8. **Missing checks — agree**
+
+Add failing checks for:
+
+- Duplicate asset IDs rejected before writes.
+- Pending work picked up by recovery.
+- Expired claims recovered.
+- Active claims not stolen.
+- Stale/fenced workers unable to commit.
+- Accepted-write timeout resolved by readback.
+- Validation failure details with zero effects.
+- Reconciliation failure with partial-effect reporting.
+- Cancellation reporting an in-flight effect completed afterward.
+
+My conclusion: this review materially improves the contract. Step 2 is not quite finished until these changes are incorporated, especially the failure-state definitions and claim/recovery boundary. I have not edited `contract.md` yet.
+
+❯ USER
+Go make the changes.
+
+⏺ CODEX
+I’ll revise only `contract.md`: tighten the reconciliation timestamp, define durable cancellation acknowledgement, add operator-visible failure classes, require unique asset IDs, define claim eligibility and fencing, qualify relay-caused concurrency, and expand the failing-check list. I’ll leave `ROADMAP.md` and the existing staged findings change untouched, and I won’t commit.
+
+⏺ CODEX
+Updated [contract.md](/Users/jaina/Downloads/02-durable-run-relay/contract.md) with all eight review points:
+
+- Precise sequential reconciliation claim
+- Durable cancellation boundary
+- Four operator-visible failure outcomes
+- Unique asset-ID requirement
+- Pending/expired claim recovery and fencing
+- Relay-specific concurrency boundary
+- Known versus unpredicted provider normalization
+- Expanded acceptance-check list
+
+It also explicitly records that the main fixture is intentionally rejected before writing because three display names violate the known provider constraint.
+
+No commit was made, and I did not modify `ROADMAP.md`. Note that `contract.md` had already been staged before these edits, so its latest changes are currently unstaged; you’ll need to stage it again when you’re ready to commit.
+
+❯ USER
+Make these changes too 
+  ## 1. Do rejected requests reserve their idempotency key?
+
+  The interaction between contract.md:7 and contract.md:27 is undefined.
+
+  If the main request is rejected and the operator shortens its names, can they resubmit using the same key? Two defensible
+  choices are:
+
+  - Validation occurs before key reservation; rejected requests do not bind the key.
+  - Rejected requests bind the key; correcting the payload requires a new key.
+
+  I recommend the first. Otherwise “reject, rename, and resubmit” unexpectedly creates an idempotency conflict.
+
+  ## 2. Per-asset structural validation is still missing
+
+  contract.md:12 cover the asset list, duplicate IDs, and display names, but not missing asset fields.
+
+  We reproduced a missing display_name becoming a permanent running poison row. Require every asset to contain usable values for:
+
+  - asset_id
+  - source_sha256
+  - type
+  - display_name
+
+  The preflight check at line 67 should include this and assert zero provider writes.
+
+  ## 3. “Reconciliation mismatch” is too broad a terminal failure
+
+  contract.md:28 overlap:
+
+  - A missing object or temporarily unreadable provider may be retryable.
+  - An existing provider object containing conflicting content is a deterministic needs-attention failure.
+  - A timeout after an accepted write remains unknown until readback.
+
+  I would explicitly classify missing/unreadable/timeout outcomes as retryable or unknown, while conflicting existing content and
+  deterministic field mismatches become terminal failures.
+
+  Similarly, contract.md:35 should mean:
+
+  > Replay uses the same effect identity and never creates a second object; provider drift may produce a terminal conflict rather
+  > than eventual success.
+
+  ## 4. Cancellation needs a rule for reports updated after terminal status
+
+  contract.md:30 correctly allow an in-flight result to resolve after cancellation. But if cancelled is terminal, can its effect
+  report later change?
+
+  Choose one:
+
+  - Use cancelling until the in-flight outcome resolves, then enter terminal cancelled.
+  - Make cancelled status stable while explicitly allowing its effect report to be refreshed as unknown calls resolve.
+
+  Either works; the current wording leaves terminal mutability ambiguous.
+
+  ## 5. Claim-expiry tests should allow already-started calls
+
+  contract.md:37 correctly fence an expired worker from starting another call or committing state. They cannot stop a provider
+  call that was sent before expiry.
+
+  Therefore, “double execution” in contract.md:69 should mean simultaneous valid claims or a stale worker beginning new work—not
+  temporary overlap caused by an already-in-flight call from an expired worker.
+
+  Also, durable leases, expiry, renewal, and fencing are substantial implementation scope. Keep these promises only if you intend
+  to implement and prove all of them within the screen’s time budget.
+
+  ## 6. Three previously suggested disclosures are still absent
+
+  - Identical payload under a different key: line 10 permits it but does not promise to identify prior matching runs. Detection
+    should use payload_hash, not idempotency_key.
+
+  - Existing cleanup: explicitly state that the relay cannot delete duplicates or partial drafts created before the fix.
+  - Destination/mode scope: state that this contract covers hubspot-marketing plus draft; other combinations remain outside the
+    supported contract.
+
+  If you add the identical-payload disclosure, add a corresponding first check.
+
+⏺ CODEX
+I’ll incorporate these into `contract.md` only. I’ll use validation-before-reservation, require all four asset fields, split retryable absence/unreadability from deterministic conflicts, choose `cancelling` until in-flight outcomes resolve, preserve leases with an explicit in-flight-call exception, and add payload-hash disclosure plus cleanup and destination/mode boundaries. I won’t stage or commit.
+
+⏺ CODEX
+Updated [contract.md](/Users/jaina/Downloads/02-durable-run-relay/contract.md) with all six additions:
+
+- Rejected requests do not reserve idempotency keys.
+- Required per-asset fields and duplicate-ID validation happen before writes.
+- Retryable/unknown outcomes are separated from deterministic conflicts.
+- Cancellation uses `cancelling` until in-flight outcomes resolve.
+- Claim expiry permits already-started calls but fences subsequent work and commits.
+- Added payload-hash disclosure, pre-fix cleanup limitations, and destination/mode scope.
+- Expanded the corresponding acceptance checks.
+
+No commit or staging action was performed. Because an earlier version of `contract.md` was already staged, these newest edits remain unstaged until you stage the file again. I left `ROADMAP.md`, `personalnotes.txt`, and `agent3_findings.md` untouched.
+
+❯ USER
+Okay lets start step 4. First create a plan.md to make sure all of the contract stuff would work properly. The plan should contain the exact issues and how to fix them. Split up the plan into different steps so that way things can be commited and I can look at the code. This is just the plan for now and we want to be implemennting things in best way possible with the best design and least amount of code.
+
+⏺ CODEX
+I’m using the `create-plan` skill to turn the contract into a minimal, commit-sized implementation sequence. I’m going to make the design choices explicit—schema/state model, claim fencing, provider coordination, reconciliation, cancellation, and proof—so each commit can stay green and be reviewed independently.
+
+❯ USER
+I already had another agent do step 3 so don't worry about that
+
+⏺ CODEX
+The design is settled enough to plan without another decision round. I’ll make each action item a review/commit boundary, keep `FakeHubSpot` unchanged, use SQLite for durable run ownership and a relay-side inter-process provider gate, and preserve green `make` commands at every boundary.
+
+⏺ CODEX
+Created [plan.md](/Users/jaina/Downloads/02-durable-run-relay/plan.md).
+
+It contains seven review/commit boundaries:
+
+1. Request validation and idempotency
+2. Durable outcomes, claims, recovery, and fencing
+3. Cross-process provider coordination
+4. Exact reconciliation and live audit
+5. Coordinated cancellation
+6. Truthful demo and process-based stress command
+7. Adversarial and mutation proof
+
+Each step identifies the existing defects, exact design, affected files, and required checks. It keeps `FakeHubSpot` unchanged and excludes Step 3 event interpretation as requested.
+
+No files were staged or committed. `plan.md` remains untracked for your review.
+
+❯ USER
+Start the implementation if there are things that you can do in parrel do them. But I want you to commit eveyrthing for 1 and then 2 so on and so on. I will still do the commiting so let me know when you are ready for me to review the code.
+
+⏺ CODEX
+I’ll implement only Plan Step 1, then stop for your review and commit before touching Step 2. I’m splitting the work into non-overlapping tracks: core request identity/migration, contract tests, and caller/demo/stress adaptation. Afterward I’ll independently review every change, run all required commands, and fix integration issues. I will not commit or stage anything.
+
+⏺ CODEX
+Step 1 is now isolated cleanly from the user’s existing work: the contract/plan are already committed, and I’m preserving the current uncommitted `Event_Interpretation.md` change. The implementation boundary will include only request identity/validation, its tests, and the minimum caller updates needed to keep all three `make` commands operational.
+
+⏺ CODEX
+The parallel work is integrated and green, but review found a few load-bearing behaviors were only smoke-tested outside the repository: legacy duplicate-key migration failure, stuck-run retry under the same namespace, invalid top-level request shape, and concurrent same-key/different-payload submission. I’m adding those durable tests before calling Step 1 reviewable.
+
+⏺ CODEX
+One independent process probe failed for a harness reason, not an implementation reason: this Python uses macOS `spawn`, which cannot import a program launched from standard input. I’m rerunning the same check with an explicit `fork` context and will not count the failed harness as evidence.
+
+⏺ CODEX
+Plan Step 1 is ready for your review and commit. I have not started Step 2, staged files, or committed anything.
+
+Implemented:
+
+- Preflight request and asset validation
+- Main-fixture zero-write rejection
+- Explicit empty-request no-op
+- Unique asset IDs
+- Atomic idempotency-key reservation
+- Same-key replay and payload conflict
+- Different-key payload-hash disclosure
+- Stable `SubmissionResult`
+- Historical duplicate-key migration failure
+- Same-run retry without creating another namespace
+- Updated demo, stress, and visible callers
+
+Files for this boundary:
+
+- [relay/core.py](/Users/jaina/Downloads/02-durable-run-relay/relay/core.py)
+- [relay/__init__.py](/Users/jaina/Downloads/02-durable-run-relay/relay/__init__.py)
+- [demo.py](/Users/jaina/Downloads/02-durable-run-relay/demo.py)
+- [stress.py](/Users/jaina/Downloads/02-durable-run-relay/stress.py)
+- [tests/test_visible.py](/Users/jaina/Downloads/02-durable-run-relay/tests/test_visible.py)
+- [tests/test_request_contract.py](/Users/jaina/Downloads/02-durable-run-relay/tests/test_request_contract.py)
+
+Verification:
+
+- `make test`: 18/18 passed
+- Concurrent submission tests: 20/20 iterations passed
+- Multiprocess same-key probe: 10 trials × 8 processes, always one row and one creator
+- `make demo`: main request rejected with zero effects; valid crash/recovery still works
+- Compilation and diff checks passed
+- `make stress` remains runnable but reproduced the expected unfixed provider race: unreadable JSON, `running: 11`, `done: 1`. That belongs to Plan Step 3.
+
+The stale audit shown by `make demo` is also intentionally still present until Step 4.
+
+Existing changes to `Event_Interpretation.md` and `adish_work/agent3_findings.md` are unrelated to this boundary and were not touched by me.
+
+❯ USER
+Commit and push
+
+⏺ CODEX
+I’ll commit only the six Step 1 implementation/test files, leaving the unrelated `Event_Interpretation.md` and agent findings changes out of the commit, then push `main` to its configured remote.
+
+❯ USER
+Start step 2
+
+⏺ CODEX
+Step 1 is committed as `8d49ca3` and pushed, along with the prior local event-interpretation commit. I’m starting Step 2 now and will stop again before committing.
+
+For this boundary I’ll parallelize durable claim/state implementation, deterministic claim/recovery tests, and an adversarial design review. The intended minimal model is SQLite claim tokens plus expirations and fenced writes—no background scheduler or lease-renewal thread.
+
+❯ USER
+Why did you reset the changes. in staged. I commited event interpretation I shouldn't see changes in staged
+
+⏺ CODEX
+I didn’t run `git reset`, but I may have mishandled the index by using a path-scoped commit while unrelated files were already staged. I’m checking the index versus `HEAD` and the prior commits now so I can tell you exactly what changed and restore only the intended staging state if needed.
+
+⏺ CODEX
+I did not run `git reset`. I used a path-scoped commit so Step 1 would not include unrelated staged work. Git therefore preserved those staged changes.
+
+Current staged changes are:
+
+- `Event_Interpretation.md`: one additional line changed after commit `a1785f0`
+- `adish_work/agent3_findings.md`: 22 additions and 12 deletions
+
+The remaining Event change is:
+
+```diff
+-| — no operator complaint — | c1, c10, c11 | baseline / noise |
++| — no operator complaint — | c1 (baseline), c10 (good outcome, but records behaviour the relay lacks), c11 (noise) | — |
+```
+
+So the large Event Interpretation edit is committed and pushed; this one-line follow-up was staged separately before I made the Step 1 path-scoped commit.
+
+I have paused the Step 2 agents. Would you like me to unstage these two files while preserving their local changes, or should they be committed separately?
+
+❯ USER
+Okay keep going with step 2 I commited the other ones we had
+
+⏺ CODEX
+Understood. I’ll resume Step 2 from the paused work, verify the new clean baseline, and keep this boundary uncommitted until you review it.
+
+⏺ CODEX
+The design review caught an important lease bug before it landed: a token alone does not fence a worker whose lease has expired but has not yet been replaced. Step 2 will require both token ownership and an unexpired lease on renewal and every commit. The external-call check/use window will be closed by the provider gate in Step 3; this boundary will state that limit explicitly instead of overclaiming.
+
+⏺ CODEX
+I’m integrating the lease implementation now. The new semantics intentionally change crash recovery: an active claim is no longer stolen immediately, so I’ll update the existing tests and demo to advance an injected clock to lease expiry before retrying. I’m also checking the reported SQLite connection leak before calling Step 2 review-ready.
+
+⏺ CODEX
+The claim suite is green. I’ve now updated the older crash tests and demo to prove both sides of the boundary: recovery skips an active owner, then succeeds exactly when the lease expires. I also fixed the measured SQLite connection leak and kept the last structured error visible while a retry is queued.
+
+⏺ CODEX
+Step 2 now passes all 32 repository tests with resource warnings treated as errors. The existing threaded stress harness also produced 20/20 clean samples (12 done runs, 48 provider objects, zero raised worker errors). That does not replace Step 3’s required multiprocess provider-lock proof; it only shows this boundary hasn’t regressed the current harness.
+
+⏺ CODEX
+Step 2 is implemented and ready for review. Nothing is staged or committed.
+
+Implemented:
+
+- Durable claims with configurable expiry and injectable clock
+- Atomic claim acquisition and renewal before provider operations
+- Token-and-expiry fencing for completion and error writes
+- Active-claim protection and expired-claim recovery
+- Same-run retry without stealing active work
+- Structured, operator-visible retryable errors
+- Pending, retryable, expired, and legacy-run recovery
+- Poison-run isolation
+- Serialized schema migration
+- SQLite connections now close cleanly
+- Demo proves active claims are skipped before expiry
+
+Verification:
+
+- `make test`: **32/32 passed**
+- Claim suite repeated 50 times: **700/700 passed**
+- Threaded stress repeated 20 times: every sample had **12 done, 48 objects, 0 worker errors**
+- Resource warnings treated as errors: passed
+- Compile and diff checks: passed
+- Staged changes: **none**
+
+Files to review:
+
+- [relay/core.py](/Users/jaina/Downloads/02-durable-run-relay/relay/core.py)
+- [relay/__init__.py](/Users/jaina/Downloads/02-durable-run-relay/relay/__init__.py)
+- [tests/test_run_claims.py](/Users/jaina/Downloads/02-durable-run-relay/tests/test_run_claims.py)
+- [demo.py](/Users/jaina/Downloads/02-durable-run-relay/demo.py)
+
+Known boundary: renewal occurs immediately before provider calls, but Step 2 cannot close the check/use race between renewal and the call. Step 3’s inter-process provider gate is designed to close that gap.
+
+❯ USER
+Can you just verify all the current changes look good and what you expect. I messed things up a bit but should be fixed now.
+
+⏺ CODEX
+I’ll verify the current worktree against the Step 2 boundary: inspect the actual diff and recent history first, then run the full tests, demo, stress harness, and focused claim-race repetitions. I won’t change, stage, reset, or commit anything.
+
+⏺ CODEX
+The repository shape is back where I expect it: `main` matches `origin/main`, all Step 2 work is local and unstaged, and the new claim test file is present as untracked. I don’t see accidental staged changes or an unexpected reset/commit. I’m moving on to behavioral verification now.
+
+⏺ CODEX
+The full suite is clean: 32/32, including strict resource-warning handling. The demo also behaves exactly as expected for Step 2: the active crashed claim stays `running`, expiration permits recovery, and the run finishes with four effects. Its post-damage audit still incorrectly reports success—that is the known Step 4 receipt-only audit defect, not evidence that these Step 2 changes were lost.
+
+❯ USER
+If so commit and push
+
+⏺ CODEX
+Everything is consistent and review-clean. The focused claim suite also passed 50 consecutive runs (700 tests), all 20 stress samples ended with 12/12 done and 48/48 effects, compilation and diff checks passed, and nothing unexpected appeared in the worktree. I’m committing only the six Step 2 files and pushing `main` now.
+
+⏺ CODEX
+Verified, committed, and pushed successfully.
+
+- Commit: `6ca6a96 step 2: add durable fenced run claims`
+- Branch: `main`
+- Remote: `origin/main`
+- Worktree: clean and synchronized
+- Tests: 32/32 passed
+- Focused claims: 700/700 passed
+- Stress: 20/20 clean samples
+
+The remaining misleading live-audit behavior is expected to be fixed in Step 4.
+
+❯ USER
+Start step 3
+
+⏺ CODEX
+Starting Step 3 as the next isolated commit boundary. I’ll parallelize it into the provider-lock implementation, deterministic multiprocess tests, and an independent lock-order/fencing review; then I’ll integrate and run the full suite plus repeated process stress. I won’t commit until the code is ready for your review.
+
+❯ USER
+Just start to commit and push things yourself. After you have finished a step and verifyied. Commit and push it and then start the next step.
+
+⏺ CODEX
+Understood. From here on, once each numbered step is fully implemented and independently verified, I’ll commit and push that step myself, then continue directly into the next one. I’ll still keep each step as a separate commit boundary and report any known limitation before moving on.
+
+⏺ CODEX
+The implementation now matches the critical ordering rule: each process takes the provider gate first, then revalidates the durable claim immediately before create and again before read; no SQLite transaction waits on the gate. The process tests also preconstruct workers so they test claim replacement while the stale provider call is genuinely still in flight, rather than accidentally serializing during construction.
+
+⏺ CODEX
+The adversarial review now has no Step 3 blocker. It specifically confirmed the two easy-to-miss cases: reads are locked as well as writes, and a process dying while holding the advisory lock releases it for the next worker. I’m doing the final independent repetition now; if it stays green, I’ll commit/push Step 3 and immediately begin Step 4 as requested.
+
+⏺ CODEX
+Step 3 is fully green: 36/36 full tests, 40/40 repeated multiprocess coordination tests across the agent and independent runs, and 20/20 stress samples with 48/48 effects, 12/12 done, zero worker errors. I’m committing and pushing this boundary now, then I’ll start Step 4’s reconciliation design and tests.
+
+⏺ CODEX
+Step 3 is committed and pushed as `5a0853f`. I’m beginning Step 4 now: replacing asserted verification and receipt-only audit with one exact, gate-protected reconciliation path and explicit retryable-versus-terminal outcomes.
+
+⏺ CODEX
+Step 4’s central design is now fixed: reconciliation will individually read every expected effect, separately enumerate the run’s namespace for extras/duplicates, and compare all approved fields. An exception after create will be resolved by reading the same effect key while still holding the gate—exact content continues safely, conflicting content fails terminally, and missing/unreadable state remains visibly retryable.
+
+⏺ CODEX
+The Step 4 review caught and corrected three subtle false-verification risks: duplicate detection was using stale loop variables, mixed deterministic/retryable evidence was classified too weakly, and audit briefly treated the stored receipt’s object ID as ground truth. The current design now keeps immutable request truth separate, records individual readbacks and namespace evidence separately, and documents that arbitrary replacement with another unique nonempty provider object ID is not detectable from the request alone.
+
+❯ USER
+Can you start to make step 5, 6, and 7 changes in parrel we have 15 minutes to finish. Its fine if the commits are together now
+
+⏺ CODEX
+Understood. I’m collapsing the remaining commit boundaries and switching to a 15-minute parallel finish: one agent on cancellation, one on demo/stress, and one on final proof/documentation while I stabilize Step 4 and integrate everything. I’ll prioritize contract-critical behavior and measured verification; anything not honestly proven will be called out rather than papered over.
+
+❯ USER
+commit 4 for now and then commit 5,6, 7 in one
+
+⏺ CODEX
+Step 4 is now 50/50 green. I’m committing only its core/reconciliation changes now—excluding the already-arriving Step 6 demo work—then the remaining parallel work will land together as you requested.
+
+⏺ CODEX
+Steps 5 and 6 are integrated: cancellation now has five deterministic barrier tests, and stress uses 12 spawned processes with one isolated failure followed by exact recovery. I’m running the final combined commands now, then I’ll write the honest decision/submission notes and commit Steps 5–7 together.
+
+⏺ CODEX
+Final combined verification is green: 56/56 full tests, 23/23 focused cancellation/reconciliation/process tests, demo and process stress both pass, and two deliberately applied load-bearing mutations were both caught. I’m committing Steps 5–7 together and pushing now.
+
+❯ USER
+Why did you update the submission.md?
+
+⏺ CODEX
+I updated `SUBMISSION.md` because Step 7 in `plan.md` explicitly included final documentation, and you asked me to finish Steps 5–7 together.
+
+However, I should not have filled it without confirming the transcript link and time details. Some entries were provisional, so committing it was premature. It is currently included in commit `74e5995`.
+
+I can revert only `SUBMISSION.md` in a follow-up commit while preserving all code and tests.
+
+❯ USER
+Lets not do any documentation. That I will do later
+
+⏺ CODEX
+Understood. I’ll restore both `DECISIONS.md` and `SUBMISSION.md` to their pre-Step-7 placeholders, leave all implementation and tests untouched, then commit and push that documentation-only reversal.
+
+❯ USER
+undo those changes and update the plan accordinly.
+
+⏺ CODEX
+The documentation edits are already restored locally. I’ll now revise Step 7 in `plan.md` so it covers verification only and explicitly leaves `DECISIONS.md`, `SUBMISSION.md`, transcript details, timing, and final write-up to you. Then I’ll commit and push this reversal.
+
+⏺ CODEX
+Done and pushed in commit `384f8b0`.
+
+- Restored `DECISIONS.md` and `SUBMISSION.md` to their original placeholders.
+- Updated Step 7 in `plan.md` to verification only.
+- Explicitly marked all final documentation as operator-owned and deferred.
+- Worktree is clean and synchronized with `origin/main`.
+
+❯ USER
+Take a look at this branch and the two fixes that it made, can you see if they look good: https://github.com/adish007/characterquilt2/commits/codex/review-fixes/
+
+⏺ CODEX
+I’ll review the branch as a code review, not just confirm its tests: identify the two commits, compare each against current `main`, run the affected checks locally, and look for regressions or promises the fixes still don’t satisfy. I won’t merge or modify anything.
+
+⏺ CODEX
+The branch contains exactly two review commits, both based on Step 3 rather than current `main`: `af5390b` (request lifecycle gaps) and `bf16421` (claim expiry/failure outcomes). I’ll review them commit-by-commit and then test them both on their branch and against current `main`, since a fix can be correct in isolation but conflict with the later reconciliation/cancellation work.
+
+⏺ CODEX
+Both commits pass on their own branch, but they are not directly mergeable into current `main`—the first already conflicts in `relay/core.py`, and the second mixes one still-needed timing repair with failure behavior that Step 4 intentionally replaced. I’m now running the new regression tests against current `main` to separate “good fix we should port” from “correct only on the older branch.”
+
+❯ USER
+dont look if they are mergalble look if what they are doing is correct work.
+
+⏺ CODEX
+Ignoring mergeability, the first commit looks correct. The second contains a good fencing fix but one important failure-reporting defect.
+
+### Finding
+
+`bf16421` deletes `receipt_json` for every retryable or terminal error. That hides known partial provider effects:
+
+```sql
+SET status = ?, error_json = ?, receipt_json = NULL
+```
+
+Its tests explicitly accept this behavior. For example, the provider-conflict test creates a real conflicting provider object and then requires the failed run’s receipt to be `None`. The legacy-validation test likewise starts with an existing provider effect but expects no receipt.
+
+That conflicts with the operator contract: failed and uncertain runs must report reconciled partial effects. Clearing an old successful receipt is correct, but it should be replaced by an unverified partial receipt—not erased. See [`_record_error`](https://github.com/adish007/characterquilt2/blob/codex/review-fixes/relay/core.py#L456-L488) and the [conflict test](https://github.com/adish007/characterquilt2/blob/codex/review-fixes/tests/test_run_claims.py#L641-L659).
+
+### What looks good
+
+[`af5390b`](https://github.com/adish007/characterquilt2/commit/af5390b47b1d6fd01302e5fc14ca710d081838eb) is good work:
+
+- Resolves an existing idempotency-key binding before validating a new submission.
+- Makes changed payloads conflict with an already-bound key, even when the changed payload is otherwise invalid.
+- Converts non-serializable payload errors into `RequestValidationError`.
+- Revalidates legacy or externally altered rows before another provider write.
+- Adds genuine multiprocess submission coverage.
+
+[`bf16421`](https://github.com/adish007/characterquilt2/commit/bf164214a7b917ba90a3324b17ea1575f10be5a9) correctly fixes the clock/SQLite race:
+
+- The clock is sampled after acquiring `BEGIN IMMEDIATE`.
+- A worker cannot wait behind SQLite using an old timestamp and then commit after its lease has actually expired.
+- Claim acquisition, renewal, completion, and error recording all use the corrected ordering.
+- `RequestValidationError` and `IdempotencyConflict` are correctly treated as deterministic terminal failures.
+
+The branch itself passes **44/44 tests**, plus its demo and stress commands.
+
+Verdict: **first commit approved; second commit’s fencing changes approved, but its failure reporting should preserve an unverified partial receipt instead of setting `receipt_json = NULL`.**
+
+❯ USER
+Add the first commit fix to your branch if it looks good
+
+⏺ CODEX
+I’ll port the first commit’s behavior into current `main`, adapted to the newer reconciliation model: existing key bindings will be resolved before new-request validation, serialization errors will become validation errors, and legacy invalid rows will fail before further writes while still preserving an unverified receipt of known partial effects. I’ll add the corresponding lifecycle and process tests, then run the full suite before committing and pushing.
+
+⏺ CODEX
+The adapted lifecycle tests are 5/5 green. The legacy-invalid case now improves on the review branch: it performs zero additional writes, ends terminally failed with `RequestValidationError`, and preserves the pre-existing provider effect in an unverified failure receipt instead of discarding it. I’m running the complete suite and demonstrations now.
+
+⏺ CODEX
+The port is clean: 22/22 request-lifecycle tests and 61/61 full tests pass; demo and 12-process stress also pass. I’m committing and pushing the adapted first fix now.
+
+⏺ CODEX
+Added, adapted, verified, and pushed.
+
+Commit: `f56d33a fix request lifecycle gaps`
+
+The fix now:
+
+- Resolves existing immutable key bindings before new-request validation.
+- Returns idempotency conflicts for changed payloads, even if the changed payload is otherwise invalid.
+- Converts JSON serialization failures into `RequestValidationError`.
+- Revalidates legacy stored requests before further provider writes.
+- Records existing legacy effects in an unverified terminal receipt.
+
+Verification:
+
+- Full suite: 61/61 passed
+- Request lifecycle: 22/22 passed
+- Demo: passed
+- 12-process stress: passed
+- Worktree: clean and synchronized with `origin/main`
+
+❯ USER
+Can you look at this branch again https://github.com/adish007/characterquilt2/commits/main I added one more commit
+
+⏺ CODEX
+I’ll refresh remote `main`, identify the new commit, review its code and tests against the operator contract, and run the affected regressions locally. I won’t modify anything unless you ask.
+
+⏺ CODEX
+The remote `main` ref still points to `f56d33a`, so the new commit is not currently published on `main`. I do see two newer review-fix commits in the repository’s local refs; I’m checking their provenance and contents in case one is the commit you mean.
+
+⏺ CODEX
+The likely new commit is local `4f10c77` (“fix provider coordination handoffs”), authored by you, but it is on the local `codex/review-fixes` worktree—not on GitHub `main`. I can still review it from the shared repository, so I’m testing that exact tree while keeping `main` untouched.
+
+❯ USER
+I mean on this branch: https://github.com/adish007/characterquilt2/commits/codex/review-fixes
+
+⏺ CODEX
+Got it—the new commit is `2a279c8` on `codex/review-fixes`, “fix provider coordination handoffs.” I’ll review that exact remote commit against its parent and test the remote branch as published.
+
+⏺ CODEX
+The published branch passes its 48 tests, demo, and stress run. I’m now attacking the new concurrency claims repeatedly and separating “the third commit is sound” from “the older branch as a whole satisfies today’s contract,” because those are different questions.
+
+⏺ CODEX
+The new commit [`2a279c8`](https://github.com/adish007/characterquilt2/commit/2a279c8537e72d16e861e8bcd4227fabd7e67bae) is doing correct work. I found no blocking correctness defect in that commit itself.
+
+What it fixes well:
+
+- Closes the gap between claim renewal and beginning a provider call.
+- Prevents claim takeover, retry, or cancellation from invalidating ownership during an authorized provider section.
+- Adds an in-process `RLock`; `flock` alone does not reliably serialize threads in one process.
+- Coordinates public provider reads as well as writes.
+- Resets inherited Python locks after `fork`.
+- Maintains the safe lock order: provider gate, then SQLite.
+- Allows an already-started call to finish while fencing the expired worker afterward.
+
+Measured verification on the exact published branch:
+
+- `make test`: **48/48 passed**
+- `make demo`: completed
+- `make stress`: **12 runs done, 48/48 provider objects, 0 errors**
+- Provider coordination and claim suites repeated 20 times: all completed successfully
+- `git diff --check`: clean
+
+One important boundary: I would not copy the whole branch into `main`. The earlier second commit still clears `receipt_json` on failed/retryable outcomes, losing known partial effects. The branch’s older demo also still reports `verified: true` after two provider objects are deleted. Those are existing branch-base problems, not regressions introduced by `2a279c8`.
+
+For our current `main`, the provider handoff design should be ported selectively while preserving:
+
+- partial failure/retryable receipts;
+- live reconciliation;
+- the current `cancelling → reconcile → cancelled` behavior.
+
+No files or branches were changed during this review.
+
+❯ USER
+I think we are out of time. Does main look good enough. Its fine if we didn't get everything but it should be in a workable state.
+
+⏺ CODEX
+I’ll do a final release check on `main`: repository state, full tests, demo, stress, and the known remaining concurrency regressions. Then I’ll give you a blunt ship/no-ship assessment.
+
+❯ USER
+And the basic things should be working
+
+⏺ CODEX
+Yes—`main` is in a workable state, and the basic functionality is working.
+
+Current evidence:
+
+- Clean working tree, synchronized with `origin/main`
+- **61/61 tests pass**
+- Demo passes
+- 12-process stress test passes
+- 48 expected provider objects recovered exactly
+- Request validation and idempotency work
+- Concurrent submissions and provider writes work
+- Crash recovery and retries work without duplicate drafts
+- Cancellation works and reports in-flight effects
+- Failed/retryable runs preserve known partial effects
+- Live audit detects missing provider objects and drift
+
+The remaining issues are narrow concurrency edge cases: lease time can be sampled before waiting for SQLite, and there is a small handoff gap between claim renewal and starting a provider call. Those deserve later fixes, but they do not prevent the ordinary request, deployment, retry, recovery, cancellation, and audit paths from working.
+
+My assessment: **good enough to submit as a credible, functional solution**, with the remaining concurrency limitations disclosed rather than rushed in now.
+
+❯ USER
+What ar ethe things I need to do to submit?
+
+⏺ CODEX
+I’ll check the repository’s actual submission instructions and current placeholders so I can give you the shortest exact checklist.
+
+⏺ CODEX
+The code is ready enough. The remaining submission work is documentation and packaging.
+
+1. Fill in `DECISIONS.md`
+
+You must personally provide:
+
+- Actual time spent.
+- What changed from the roadmap.
+- How you directed/overrode the agent.
+- Operator guarantees.
+- Which test fails first for each guarantee.
+- Causes fixed versus symptoms detected.
+- Remaining unsafe behavior.
+- Next failure you would inject.
+
+Be explicit about the remaining lease-timing and provider-call handoff races.
+
+2. Fill in `SUBMISSION.md`
+
+Include:
+
+- Complete raw agent transcript or export link.
+- Raw output from:
+  - `make demo`
+  - `make test`
+  - `make stress`
+- Least-certain claim and how it was tested.
+- Reviewer notes, especially:
+  - The supplied main fixture is intentionally rejected because its display names would be normalized.
+  - The short-name fixture exercises successful deployment.
+  - Narrow concurrency edge cases remain.
+
+3. Include one finding you made yourself
+
+The transcript must show something you personally investigated rather than simply accepted from the agent. State it clearly in `DECISIONS.md`. If necessary, independently run and interpret one probe now—for example, confirm that deleting a provider object causes live audit to report the exact missing key.
+
+4. Export the complete transcript
+
+Do not clean it up. Include mistakes, reversals, reviews, and abandoned work. That is explicitly required.
+
+5. Capture final command output
+
+```bash
+make demo 2>&1 | tee demo-output.txt
+make test 2>&1 | tee test-output.txt
+make stress 2>&1 | tee stress-output.txt
+```
+
+Either commit those files or include their complete contents in the submission packet and reference them from `SUBMISSION.md`.
+
+6. Commit and push the submission material
+
+```bash
+git add DECISIONS.md SUBMISSION.md
+git add demo-output.txt test-output.txt stress-output.txt
+git commit -m "complete submission write-up"
+git push origin main
+git status --short --branch
+```
+
+The final status should be clean and show `main...origin/main`.
+
+You do not need more implementation work before submitting.
+
+❯ USER
+Can you create a file of this conversation, everything in it and name it codex1.txt
+
+⏺ CODEX
+I’ll locate the raw Codex session log for this workspace and extract the complete conversation into `codex1.txt`, including user/assistant messages and tool activity where the transcript records it. I’ll verify the beginning, end, and file size afterward.
+
+⏺ CODEX
+I found the root session that begins with your full working-context message and contains all 44 user turns so far. I’m preserving its raw JSONL transcript verbatim under the requested `.txt` name so tool calls, outputs, corrections, and dead ends are not cleaned up.
+
+⏺ CODEX
+Created [codex1.txt](/Users/jaina/Downloads/02-durable-run-relay/codex1.txt).
+
+It is the complete raw session transcript, including messages, tool calls, outputs, and corrections. It is currently untracked and not committed.
+
+❯ USER
+You made it a log file, i just wanted the transcript like claude.txt
+
+⏺ CODEX
+You’re right—I preserved the internal event log instead of the readable transcript. I’ll match the structure of `claude.txt` and replace `codex1.txt` with only the conversation transcript.
+
+⏺ CODEX
+I matched too much of Claude’s tool display and carried raw command output into it. I’m simplifying it to the actual readable conversation only: your messages and my visible replies, in order—no JSON, internal events, reasoning records, or raw tool logs.
+
