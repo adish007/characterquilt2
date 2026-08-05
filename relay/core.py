@@ -371,12 +371,93 @@ class Relay:
         result.pop("claim_token")
         return result
 
-    def cancel(self, run_id: str) -> None:
+    def cancel(self, run_id: str) -> dict[str, Any] | None:
+        """Acknowledge cancellation, fence workers, then report known effects."""
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT status, receipt_json FROM deployments WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(run_id)
+            status = str(row["status"])
+            if status in {"done", "failed", "cancelled"}:
+                receipt_json = row["receipt_json"]
+                return (
+                    json.loads(str(receipt_json))
+                    if receipt_json is not None
+                    else None
+                )
             connection.execute(
-                "UPDATE deployments SET status = 'cancelled' WHERE id = ?",
+                """
+                UPDATE deployments
+                SET status = 'cancelling', claim_token = NULL,
+                    claim_expires_at = NULL
+                WHERE id = ? AND status IN
+                    ('pending', 'running', 'retryable', 'cancelling')
+                """,
                 (run_id,),
             )
+
+        # A worker that was already inside the provider gate may finish its
+        # current call. Clearing its claim above prevents another call or a
+        # later status commit. Taking the same gate waits for that call.
+        run = self.get(run_id)
+        with self._provider_coordinator.hold():
+            report = self._reconcile_locked(run)
+            unreadable = any(
+                issue["kind"] == "provider_unreadable"
+                for issue in report["issues"]
+            )
+            report = dict(report)
+            report["verified"] = False
+            report["outcome"] = "unknown" if unreadable else "cancelled"
+            error = (
+                {
+                    "type": "CancellationUnknown",
+                    "message": "provider state could not be fully reconciled",
+                    "retryable": True,
+                    "issues": report["issues"],
+                }
+                if unreadable
+                else None
+            )
+            with self._connect() as connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE deployments
+                    SET status = ?, receipt_json = ?, error_json = ?,
+                        claim_token = NULL, claim_expires_at = NULL
+                    WHERE id = ? AND status = 'cancelling'
+                    """,
+                    (
+                        "cancelling" if unreadable else "cancelled",
+                        _canonical_json(report),
+                        _canonical_json(error) if error is not None else None,
+                        run_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    latest = connection.execute(
+                        "SELECT status, receipt_json FROM deployments WHERE id = ?",
+                        (run_id,),
+                    ).fetchone()
+                    if latest is not None and latest["status"] in {
+                        "done",
+                        "failed",
+                        "cancelled",
+                    }:
+                        latest_receipt = latest["receipt_json"]
+                        return (
+                            json.loads(str(latest_receipt))
+                            if latest_receipt is not None
+                            else None
+                        )
+                    raise RuntimeError(
+                        f"cancellation transition for run {run_id!r} was lost"
+                    )
+        return report
 
     def retry(self, run_id: str) -> str:
         """Return the same logical run, requeuing only unfinished work."""
@@ -1096,8 +1177,20 @@ class Relay:
                 """,
                 (now,),
             ).fetchall()
+            cancelling_rows = connection.execute(
+                """
+                SELECT id FROM deployments
+                WHERE status = 'cancelling'
+                ORDER BY rowid
+                """
+            ).fetchall()
         for row in rows:
             try:
                 self.run_once(str(row["id"]))
+            except Exception:
+                continue
+        for row in cancelling_rows:
+            try:
+                self.cancel(str(row["id"]))
             except Exception:
                 continue

@@ -375,6 +375,23 @@ class RequestContractTest(unittest.TestCase):
         ):
             Relay(legacy_db, legacy_provider)
 
+    def test_database_enforces_idempotency_key_uniqueness(self) -> None:
+        submission = self.relay.submit("database-unique", valid_payload())
+        with closing(sqlite3.connect(self.db_path)) as connection, connection:
+            payload_hash, payload_json = connection.execute(
+                "SELECT payload_hash, payload_json FROM deployments WHERE id = ?",
+                (submission.run_id,),
+            ).fetchone()
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    """
+                    INSERT INTO deployments
+                        (id, idempotency_key, payload_hash, payload_json, status)
+                    VALUES ('raw-duplicate', 'database-unique', ?, ?, 'pending')
+                    """,
+                    (payload_hash, payload_json),
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
