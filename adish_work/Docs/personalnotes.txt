@@ -49,7 +49,7 @@ C8 seems like 3 different bugs and that is something we will need to look at mor
      verified is unconditional, audit is not live, and completed runs are never reconciled by recovery.
 
 
-Retrying a run is different than reexecuting the same run. We get 4 additional provider objects more everytime we retry but reexecuting the ssame run 
+Retrying a run is different than reexecuting the same run. We get 4 additional provider objects more everytime we retry but reexecuting the same run 
 just gives us four still
 
 
