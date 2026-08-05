@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -300,6 +301,7 @@ class RunClaimsTest(unittest.TestCase):
 
     def test_two_workers_cannot_hold_valid_claims_for_one_run(self) -> None:
         run_id = self.submit("single-owner")
+        contender = self.new_relay()
         blocking = BlockingProvider(self.relay.provider)
         self.relay.provider = blocking
 
@@ -308,7 +310,6 @@ class RunClaimsTest(unittest.TestCase):
             self.assertTrue(blocking.entered.wait(timeout=2))
             claimed = raw_claim(self.db_path, run_id)
 
-            contender = self.new_relay()
             with self.assertRaises(RunClaimed):
                 contender.run_once(run_id)
 
@@ -347,21 +348,25 @@ class RunClaimsTest(unittest.TestCase):
         run_id = self.relay.submit("fenced", request).run_id
         blocking = BlockingProvider(self.relay.provider)
         self.relay.provider = blocking
+        replacement = self.new_relay()
 
-        with ThreadPoolExecutor(max_workers=1) as executor:
+        with ThreadPoolExecutor(max_workers=2) as executor:
             old_worker = executor.submit(self.relay.run_once, run_id)
             self.assertTrue(blocking.entered.wait(timeout=2))
             old_claim, _ = raw_claim(self.db_path, run_id)
             self.clock.advance(self.claim_ttl + 1)
 
-            replacement = self.new_relay()
-            replacement_receipt = replacement.run_once(run_id)
-            replacement_claim, _ = raw_claim(self.db_path, run_id)
-            self.assertNotEqual(replacement_claim, old_claim)
+            replacement_worker = executor.submit(replacement.run_once, run_id)
+            deadline = time.monotonic() + 2
+            while raw_claim(self.db_path, run_id)[0] == old_claim:
+                if time.monotonic() >= deadline:
+                    self.fail("replacement did not acquire the expired claim")
+                time.sleep(0.01)
 
             blocking.release.set()
             with self.assertRaises(ClaimLost):
                 old_worker.result(timeout=2)
+            replacement_receipt = replacement_worker.result(timeout=2)
 
         final = self.relay.get(run_id)
         self.assertEqual(final["status"], "done")
@@ -374,6 +379,7 @@ class RunClaimsTest(unittest.TestCase):
 
     def test_retry_returns_same_run_without_stealing_active_claim(self) -> None:
         run_id = self.submit("active-retry")
+        retrier = self.new_relay()
         blocking = BlockingProvider(self.relay.provider)
         self.relay.provider = blocking
 
@@ -383,7 +389,7 @@ class RunClaimsTest(unittest.TestCase):
             before = raw_claim(self.db_path, run_id)
 
             with self.assertRaises(RunClaimed):
-                self.new_relay().retry(run_id)
+                retrier.retry(run_id)
 
             after = self.relay.get(run_id)
             self.assertEqual(after["id"], run_id)

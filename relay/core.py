@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
+import os
 import sqlite3
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 
 class InjectedCrash(RuntimeError):
@@ -42,6 +45,26 @@ class _ClosingConnection(sqlite3.Connection):
             return bool(super().__exit__(exc_type, exc_value, traceback))
         finally:
             self.close()
+
+
+class _ProviderCoordinator:
+    """Serialize the provider's whole-file operations across relay processes."""
+
+    def __init__(self, state_path: Path) -> None:
+        state_path = Path(state_path)
+        self.lock_path = state_path.with_name(f"{state_path.name}.lock")
+
+    @contextmanager
+    def hold(self) -> Iterator[None]:
+        descriptor = os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,7 +152,13 @@ class Relay:
         if claim_ttl_seconds <= 0:
             raise ValueError("claim_ttl_seconds must be positive")
         self.db_path = Path(db_path)
-        self.provider = FakeHubSpot(provider_state_path)
+        provider_state_path = Path(provider_state_path).resolve()
+        self._provider_coordinator = _ProviderCoordinator(provider_state_path)
+        if provider_state_path.exists():
+            self.provider = FakeHubSpot(provider_state_path)
+        else:
+            with self._provider_coordinator.hold():
+                self.provider = FakeHubSpot(provider_state_path)
         self._clock = clock or time.time
         self.claim_ttl_seconds = float(claim_ttl_seconds)
         self._init_db()
@@ -536,17 +565,18 @@ class Relay:
             readbacks: list[dict[str, str]] = []
             for index, asset in enumerate(run["payload"]["assets"]):
                 external_key = f"{run_id}:{asset['asset_id']}"
-                self._renew_claim(run_id, claim_token)
-                self.provider.create_draft(
-                    external_key=external_key,
-                    asset=asset,
-                )
-                if crash_at == "after_first_provider_write" and index == 0:
-                    raise InjectedCrash(
-                        "crashed after provider write and before local receipt"
+                with self._provider_coordinator.hold():
+                    self._renew_claim(run_id, claim_token)
+                    self.provider.create_draft(
+                        external_key=external_key,
+                        asset=asset,
                     )
-                self._renew_claim(run_id, claim_token)
-                readbacks.append(self.provider.read(external_key))
+                    if crash_at == "after_first_provider_write" and index == 0:
+                        raise InjectedCrash(
+                            "crashed after provider write and before local receipt"
+                        )
+                    self._renew_claim(run_id, claim_token)
+                    readbacks.append(self.provider.read(external_key))
 
             receipt = {
                 "run_id": run_id,
