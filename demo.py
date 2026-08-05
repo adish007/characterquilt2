@@ -1,0 +1,64 @@
+from __future__ import annotations
+
+import json
+import tempfile
+from pathlib import Path
+
+from relay import InjectedCrash, Relay
+
+
+def main() -> None:
+    payload = json.loads(
+        Path("fixtures/deployment_request.json").read_text()
+    )
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        db_path = root / "deployments.db"
+        provider_path = root / "fake-hubspot.json"
+        relay = Relay(db_path, provider_path)
+        run_id = relay.submit("campaign-deploy-001", payload)
+
+        try:
+            relay.run_once(
+                run_id,
+                crash_at="after_first_provider_write",
+            )
+        except InjectedCrash as error:
+            print(f"INJECTED CRASH: {error}")
+
+        restarted = Relay(db_path, provider_path)
+        restarted.recover()
+        print("DEPLOYMENT SUMMARY")
+        print(json.dumps(restarted.deployment_summary(run_id), indent=2))
+        print("OPERATOR PRESSED CHECK AGAIN")
+        print(json.dumps(restarted.audit(run_id), indent=2))
+        print(
+            "objects the destination is holding: "
+            f"{len(restarted.provider.list_objects())}"
+        )
+
+        # The destination dropped two objects. This is not hypothetical --
+        # `make stress` runs the worker pool and the count comes back short.
+        stored = json.loads(provider_path.read_text())
+        for key in list(stored)[:2]:
+            del stored[key]
+        provider_path.write_text(json.dumps(stored))
+
+        after = Relay(db_path, provider_path)
+        print()
+        print("SAME RUN, AFTER THE DESTINATION LOST TWO OBJECTS")
+        print(json.dumps(after.deployment_summary(run_id), indent=2))
+        print("OPERATOR PRESSED CHECK AGAIN")
+        print(json.dumps(after.audit(run_id), indent=2))
+        print(
+            "objects the destination is holding: "
+            f"{len(after.provider.list_objects())}"
+        )
+
+        print()
+        print("FINAL STATE")
+        print(json.dumps(after.get(run_id), indent=2))
+
+
+if __name__ == "__main__":
+    main()
