@@ -333,7 +333,7 @@ class RunClaimsTest(unittest.TestCase):
 
         self.assertEqual(
             len(provider.observations),
-            len(request["assets"]) * 2,
+            len(request["assets"]) * 3,
         )
         tokens = {token for _, _, token in provider.observations}
         self.assertEqual(len(tokens), 1)
@@ -527,7 +527,10 @@ class RunClaimsTest(unittest.TestCase):
         self.assertEqual(run["error"]["type"], "RuntimeError")
         self.assertIn("provider refused", run["error"]["message"])
         self.assertTrue(run["error"]["retryable"])
-        self.assertIsNone(run["receipt"])
+        self.assertIsInstance(run["receipt"], dict)
+        self.assertFalse(run["receipt"]["verified"])
+        self.assertEqual(run["receipt"]["outcome"], "retryable")
+        self.assertTrue(run["receipt"]["issues"])
 
         self.assertEqual(
             self.relay.deployment_summary(run_id)["error"],

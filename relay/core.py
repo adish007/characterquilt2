@@ -37,6 +37,14 @@ class ClaimLost(RuntimeError):
     pass
 
 
+class _OutcomeRecorded(RuntimeError):
+    """Keep an already-persisted outcome out of the generic error handler."""
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__(str(error))
+        self.error = error
+
+
 class _ClosingConnection(sqlite3.Connection):
     """Make ``with self._connect()`` close as well as transact."""
 
@@ -445,28 +453,310 @@ class Relay:
         run_id: str,
         claim_token: str,
         error: Exception,
+        receipt: dict[str, Any] | None = None,
     ) -> None:
+        if receipt is not None and receipt.get("outcome") != "retryable":
+            raise ValueError("retryable state requires a retryable receipt")
         now = float(self._clock())
         error_json = _canonical_json(
             {
                 "type": type(error).__name__,
                 "message": str(error),
                 "retryable": True,
+                "issues": (receipt or {}).get("issues", []),
             }
         )
         with self._connect() as connection:
             cursor = connection.execute(
                 """
                 UPDATE deployments
-                SET status = 'retryable', error_json = ?,
+                SET status = 'retryable', error_json = ?, receipt_json = ?,
                     claim_token = NULL, claim_expires_at = NULL
                 WHERE id = ? AND status = 'running'
                     AND claim_token = ? AND claim_expires_at > ?
                 """,
-                (error_json, run_id, claim_token, now),
+                (
+                    error_json,
+                    _canonical_json(receipt) if receipt is not None else None,
+                    run_id,
+                    claim_token,
+                    now,
+                ),
             )
             if cursor.rowcount != 1:
                 raise ClaimLost(f"claim for run {run_id!r} is no longer active")
+
+    def _mark_failed(
+        self,
+        run_id: str,
+        claim_token: str,
+        error: Exception,
+        receipt: dict[str, Any],
+    ) -> None:
+        if receipt.get("outcome") != "failed":
+            raise ValueError("failed state requires a failed receipt")
+        now = float(self._clock())
+        error_json = _canonical_json(
+            {
+                "type": type(error).__name__,
+                "message": str(error),
+                "retryable": False,
+                "issues": receipt["issues"],
+            }
+        )
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE deployments
+                SET status = 'failed', receipt_json = ?, error_json = ?,
+                    claim_token = NULL, claim_expires_at = NULL
+                WHERE id = ? AND status = 'running'
+                    AND claim_token = ? AND claim_expires_at > ?
+                """,
+                (
+                    _canonical_json(receipt),
+                    error_json,
+                    run_id,
+                    claim_token,
+                    now,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ClaimLost(f"claim for run {run_id!r} is no longer active")
+
+    @staticmethod
+    def _expected_provider_object(
+        run_id: str,
+        asset: dict[str, Any],
+    ) -> dict[str, str]:
+        external_key = f"{run_id}:{asset['asset_id']}"
+        return {
+            "external_key": external_key,
+            "source_asset_id": str(asset["asset_id"]),
+            "source_sha256": str(asset["source_sha256"]),
+            "object_type": str(asset["type"]),
+            "display_name": str(asset["display_name"]),
+            "status": "draft",
+        }
+
+    @staticmethod
+    def _field_mismatches(
+        expected: dict[str, str],
+        actual: dict[str, Any],
+    ) -> dict[str, dict[str, Any]]:
+        return {
+            field: {"expected": value, "actual": actual.get(field)}
+            for field, value in expected.items()
+            if actual.get(field) != value
+        }
+
+    def _reconcile_locked(
+        self,
+        run: dict[str, Any],
+        *,
+        claim_token: str | None = None,
+    ) -> dict[str, Any]:
+        """Read and compare one run's namespace while holding the provider gate."""
+        run_id = str(run["id"])
+        expected = {
+            expected_object["external_key"]: expected_object
+            for expected_object in (
+                self._expected_provider_object(run_id, asset)
+                for asset in run["payload"]["assets"]
+            )
+        }
+        issues: list[dict[str, Any]] = []
+
+        try:
+            if claim_token is not None:
+                self._renew_claim(run_id, claim_token)
+            listed = self.provider.list_objects()
+        except ClaimLost:
+            raise
+        except Exception as error:
+            issues.append(
+                {
+                    "kind": "provider_unreadable",
+                    "error": {
+                        "type": type(error).__name__,
+                        "message": str(error),
+                    },
+                }
+            )
+            return self._reconciliation_report(run, [], issues)
+
+        if not isinstance(listed, list) or any(
+            not isinstance(obj, dict) for obj in listed
+        ):
+            issues.append(
+                {
+                    "kind": "provider_unreadable",
+                    "error": {
+                        "type": "TypeError",
+                        "message": "provider listing was not a list of objects",
+                    },
+                }
+            )
+            return self._reconciliation_report(run, [], issues)
+
+        prefix = f"{run_id}:"
+        namespace_objects = [
+            dict(obj)
+            for obj in listed
+            if isinstance(obj.get("external_key"), str)
+            and obj["external_key"].startswith(prefix)
+        ]
+        namespace_objects.sort(key=_canonical_json)
+        by_key: dict[str, list[dict[str, Any]]] = {}
+        by_object_id: dict[str, list[str]] = {}
+        for obj in namespace_objects:
+            external_key = str(obj.get("external_key"))
+            by_key.setdefault(external_key, []).append(obj)
+            object_id = obj.get("object_id")
+            if not isinstance(object_id, str) or not object_id.strip():
+                issues.append(
+                    {"kind": "invalid_object_id", "external_key": external_key}
+                )
+            else:
+                by_object_id.setdefault(object_id, []).append(external_key)
+
+        for external_key, matches in sorted(by_key.items()):
+            if external_key not in expected:
+                issues.append(
+                    {"kind": "unexpected", "external_key": external_key}
+                )
+            if len(matches) > 1:
+                issues.append(
+                    {
+                        "kind": "duplicate",
+                        "external_key": external_key,
+                        "count": len(matches),
+                    }
+                )
+
+        for object_id, external_keys in sorted(by_object_id.items()):
+            if len(external_keys) > 1:
+                issues.append(
+                    {
+                        "kind": "duplicate_object_id",
+                        "object_id": object_id,
+                        "external_keys": sorted(external_keys),
+                    }
+                )
+
+        # Individual readbacks, rather than the list count, are the evidence
+        # used for completion. The coordinator keeps relay-owned operations
+        # from changing the provider document during this pass.
+        readbacks: list[dict[str, Any]] = []
+        for external_key, expected_object in expected.items():
+            try:
+                if claim_token is not None:
+                    self._renew_claim(run_id, claim_token)
+                actual = self.provider.read(external_key)
+                if not isinstance(actual, dict):
+                    raise TypeError("provider readback was not an object")
+            except ClaimLost:
+                raise
+            except KeyError:
+                issues.append({"kind": "missing", "external_key": external_key})
+                continue
+            except Exception as error:
+                issues.append(
+                    {
+                        "kind": "provider_unreadable",
+                        "external_key": external_key,
+                        "error": {
+                            "type": type(error).__name__,
+                            "message": str(error),
+                        },
+                    }
+                )
+                continue
+            readbacks.append(dict(actual))
+            mismatches = self._field_mismatches(expected_object, actual)
+            object_id = actual.get("object_id")
+            if not isinstance(object_id, str) or not object_id.strip():
+                issues.append(
+                    {"kind": "invalid_object_id", "external_key": external_key}
+                )
+            if mismatches:
+                issues.append(
+                    {
+                        "kind": "mismatch",
+                        "external_key": external_key,
+                        "fields": mismatches,
+                    }
+                )
+
+        return self._reconciliation_report(
+            run,
+            readbacks,
+            issues,
+            namespace_objects=namespace_objects,
+        )
+
+    @staticmethod
+    def _reconciliation_report(
+        run: dict[str, Any],
+        objects: list[dict[str, Any]],
+        issues: list[dict[str, Any]],
+        *,
+        namespace_objects: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        retryable_kinds = {
+            "missing",
+            "provider_unreadable",
+            "ambiguous_write",
+            "execution_error",
+        }
+        if not issues:
+            outcome = "verified"
+        elif any(issue["kind"] not in retryable_kinds for issue in issues):
+            outcome = "failed"
+        else:
+            outcome = "retryable"
+        return {
+            "run_id": str(run["id"]),
+            "payload_sha256": str(run["payload_hash"]),
+            "objects": objects,
+            "namespace_objects": namespace_objects or [],
+            "issues": sorted(issues, key=_canonical_json),
+            "verified": outcome == "verified",
+            "outcome": outcome,
+        }
+
+    def _merge_direct_conflict(
+        self,
+        run: dict[str, Any],
+        report: dict[str, Any],
+        external_key: str,
+        actual: dict[str, Any],
+        mismatches: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Preserve deterministic evidence observed before a later readback."""
+        objects = list(report["objects"])
+        if actual not in objects:
+            objects.append(dict(actual))
+        issues = list(report["issues"])
+        if mismatches:
+            issues.append(
+                {
+                    "kind": "mismatch",
+                    "external_key": external_key,
+                    "fields": mismatches,
+                }
+            )
+        object_id = actual.get("object_id")
+        if not isinstance(object_id, str) or not object_id.strip():
+            issues.append(
+                {"kind": "invalid_object_id", "external_key": external_key}
+            )
+        return self._reconciliation_report(
+            run,
+            objects,
+            issues,
+            namespace_objects=report["namespace_objects"],
+        )
 
     def _complete(
         self,
@@ -562,37 +852,183 @@ class Relay:
 
         try:
             run = self.get(run_id)
-            readbacks: list[dict[str, str]] = []
             for index, asset in enumerate(run["payload"]["assets"]):
                 external_key = f"{run_id}:{asset['asset_id']}"
                 with self._provider_coordinator.hold():
                     self._renew_claim(run_id, claim_token)
-                    self.provider.create_draft(
-                        external_key=external_key,
-                        asset=asset,
-                    )
-                    if crash_at == "after_first_provider_write" and index == 0:
-                        raise InjectedCrash(
-                            "crashed after provider write and before local receipt"
+                    try:
+                        self.provider.create_draft(
+                            external_key=external_key,
+                            asset=asset,
                         )
-                    self._renew_claim(run_id, claim_token)
-                    readbacks.append(self.provider.read(external_key))
+                        if crash_at == "after_first_provider_write" and index == 0:
+                            raise InjectedCrash(
+                                "crashed after provider write and before local receipt"
+                            )
+                    except InjectedCrash:
+                        raise
+                    except ClaimLost:
+                        raise
+                    except Exception as create_error:
+                        # A write may have been accepted before its response
+                        # failed. Resolve that ambiguity by reading the same
+                        # stable effect identity before considering a replay.
+                        self._renew_claim(run_id, claim_token)
+                        try:
+                            actual = self.provider.read(external_key)
+                            if not isinstance(actual, dict):
+                                raise TypeError("provider readback was not an object")
+                        except ClaimLost:
+                            raise
+                        except Exception:
+                            report = self._reconcile_locked(
+                                run,
+                                claim_token=claim_token,
+                            )
+                            report["issues"].append(
+                                {
+                                    "kind": "ambiguous_write",
+                                    "external_key": external_key,
+                                    "error": {
+                                        "type": type(create_error).__name__,
+                                        "message": str(create_error),
+                                    },
+                                }
+                            )
+                            report = self._reconciliation_report(
+                                run,
+                                report["objects"],
+                                report["issues"],
+                                namespace_objects=report["namespace_objects"],
+                            )
+                            self._mark_retryable(
+                                run_id,
+                                claim_token,
+                                create_error,
+                                report,
+                            )
+                            raise _OutcomeRecorded(create_error)
 
-            receipt = {
-                "run_id": run_id,
-                "payload_sha256": run["payload_hash"],
-                "objects": readbacks,
-                "verified": True,
-            }
-            self._complete(run_id, claim_token, receipt)
-            return receipt
+                        expected = self._expected_provider_object(run_id, asset)
+                        mismatches = self._field_mismatches(expected, actual)
+                        object_id = actual.get("object_id")
+                        if (
+                            mismatches
+                            or not isinstance(object_id, str)
+                            or not object_id.strip()
+                        ):
+                            report = self._reconcile_locked(
+                                run,
+                                claim_token=claim_token,
+                            )
+                            report = self._merge_direct_conflict(
+                                run,
+                                report,
+                                external_key,
+                                actual,
+                                mismatches,
+                            )
+                            self._mark_failed(
+                                run_id,
+                                claim_token,
+                                create_error,
+                                report,
+                            )
+                            raise _OutcomeRecorded(create_error)
+                    else:
+                        self._renew_claim(run_id, claim_token)
+                        try:
+                            actual = self.provider.read(external_key)
+                        except KeyError as error:
+                            raise RuntimeError(
+                                f"provider object {external_key!r} was missing "
+                                "after create"
+                            ) from error
+                        if not isinstance(actual, dict):
+                            raise TypeError("provider readback was not an object")
+                        expected = self._expected_provider_object(run_id, asset)
+                        mismatches = self._field_mismatches(expected, actual)
+                        object_id = actual.get("object_id")
+                        if (
+                            mismatches
+                            or not isinstance(object_id, str)
+                            or not object_id.strip()
+                        ):
+                            report = self._reconcile_locked(
+                                run,
+                                claim_token=claim_token,
+                            )
+                            report = self._merge_direct_conflict(
+                                run,
+                                report,
+                                external_key,
+                                actual,
+                                mismatches,
+                            )
+                            error = RuntimeError(
+                                f"provider returned conflicting content for "
+                                f"{external_key!r}"
+                            )
+                            self._mark_failed(
+                                run_id,
+                                claim_token,
+                                error,
+                                report,
+                            )
+                            raise _OutcomeRecorded(error)
+            with self._provider_coordinator.hold():
+                receipt = self._reconcile_locked(run, claim_token=claim_token)
+                if receipt["outcome"] == "verified":
+                    self._complete(run_id, claim_token, receipt)
+                    return receipt
+
+                error = RuntimeError(
+                    f"provider reconciliation {receipt['outcome']} for run {run_id!r}"
+                )
+                if receipt["outcome"] == "failed":
+                    self._mark_failed(run_id, claim_token, error, receipt)
+                else:
+                    self._mark_retryable(run_id, claim_token, error, receipt)
+                raise _OutcomeRecorded(error)
         except InjectedCrash:
             raise
         except ClaimLost:
             raise
+        except _OutcomeRecorded as recorded:
+            raise recorded.error
         except Exception as error:
             try:
-                self._mark_retryable(run_id, claim_token, error)
+                with self._provider_coordinator.hold():
+                    report = self._reconcile_locked(run, claim_token=claim_token)
+                    report["issues"].append(
+                        {
+                            "kind": "execution_error",
+                            "error": {
+                                "type": type(error).__name__,
+                                "message": str(error),
+                            },
+                        }
+                    )
+                    report = self._reconciliation_report(
+                        run,
+                        report["objects"],
+                        report["issues"],
+                        namespace_objects=report["namespace_objects"],
+                    )
+                    if report["outcome"] == "failed":
+                        self._mark_failed(
+                            run_id,
+                            claim_token,
+                            error,
+                            report,
+                        )
+                    else:
+                        self._mark_retryable(
+                            run_id,
+                            claim_token,
+                            error,
+                            report,
+                        )
             except ClaimLost as claim_error:
                 raise claim_error from error
             raise
@@ -609,8 +1045,11 @@ class Relay:
         return {
             "run_id": run_id,
             "status": run["status"],
+            "stored_status": run["status"],
             "objects_deployed": len(objects),
-            "verified": bool(receipt.get("verified")),
+            "stored_verified": bool(receipt.get("verified")),
+            "current_verified": None,
+            "verification_source": "stored_receipt",
             "assets_approved": len(run["payload"].get("assets", [])),
             "error": run.get("error"),
         }
@@ -622,13 +1061,18 @@ class Relay:
         still in the state the receipt describes.
         """
         run = self.get(run_id)
-        receipt = run.get("receipt") or {}
-        objects = receipt.get("objects") or []
+        with self._provider_coordinator.hold():
+            report = self._reconcile_locked(run)
         return {
-            "run_id": run_id,
-            "checked_objects": len(objects),
-            "all_present": all(obj.get("object_id") for obj in objects),
-            "verified": bool(receipt.get("verified")),
+            **report,
+            "checked_objects": len(report["objects"]),
+            "all_present": not any(
+                issue["kind"] in {"missing", "provider_unreadable"}
+                for issue in report["issues"]
+            ),
+            "stored_status": run["status"],
+            "stored_verified": bool((run.get("receipt") or {}).get("verified")),
+            "current_verified": bool(report["verified"]),
         }
 
     def recover(self) -> None:
