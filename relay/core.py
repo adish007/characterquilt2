@@ -241,15 +241,18 @@ class Relay:
                     "historical duplicate deployment keys exist"
                 ) from error
 
+    def _validate_idempotency_key(self, idempotency_key: str) -> None:
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            raise RequestValidationError(
+                "idempotency_key must be a non-empty string"
+            )
+
     def _validate_request(
         self,
         idempotency_key: str,
         payload: dict[str, Any],
     ) -> None:
-        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
-            raise RequestValidationError(
-                "idempotency_key must be a non-empty string"
-            )
+        self._validate_idempotency_key(idempotency_key)
         if not isinstance(payload, dict):
             raise RequestValidationError("payload must be an object")
         if payload.get("destination") != "hubspot-marketing":
@@ -301,8 +304,13 @@ class Relay:
         idempotency_key: str,
         payload: dict[str, Any],
     ) -> SubmissionResult:
-        self._validate_request(idempotency_key, payload)
-        payload_json = _canonical_json(payload)
+        self._validate_idempotency_key(idempotency_key)
+        try:
+            payload_json = _canonical_json(payload)
+        except (TypeError, ValueError) as error:
+            raise RequestValidationError(
+                "payload must be JSON-serializable"
+            ) from error
         payload_hash = _digest_text(payload_json)
         run_id = str(uuid.uuid4())
         with self._connect() as connection:
@@ -336,6 +344,7 @@ class Relay:
                     replayed=True,
                     matching_payload_run_ids=matching_run_ids,
                 )
+            self._validate_request(idempotency_key, payload)
             connection.execute(
                 """
                 INSERT INTO deployments
@@ -630,6 +639,55 @@ class Relay:
             for field, value in expected.items()
             if actual.get(field) != value
         }
+
+    def _invalid_stored_request_report_locked(
+        self,
+        run: dict[str, Any],
+        claim_token: str,
+        error: RequestValidationError,
+    ) -> dict[str, Any]:
+        """Report known effects when a legacy stored request is invalid."""
+        self._renew_claim(str(run["id"]), claim_token)
+        issues: list[dict[str, Any]] = [
+            {
+                "kind": "invalid_stored_request",
+                "error": {
+                    "type": type(error).__name__,
+                    "message": str(error),
+                },
+            }
+        ]
+        namespace_objects: list[dict[str, Any]] = []
+        try:
+            listed = self.provider.list_objects()
+            if not isinstance(listed, list) or any(
+                not isinstance(obj, dict) for obj in listed
+            ):
+                raise TypeError("provider listing was not a list of objects")
+            prefix = f"{run['id']}:"
+            namespace_objects = [
+                dict(obj)
+                for obj in listed
+                if isinstance(obj.get("external_key"), str)
+                and obj["external_key"].startswith(prefix)
+            ]
+            namespace_objects.sort(key=_canonical_json)
+        except Exception as provider_error:
+            issues.append(
+                {
+                    "kind": "provider_unreadable",
+                    "error": {
+                        "type": type(provider_error).__name__,
+                        "message": str(provider_error),
+                    },
+                }
+            )
+        return self._reconciliation_report(
+            run,
+            namespace_objects,
+            issues,
+            namespace_objects=namespace_objects,
+        )
 
     def _reconcile_locked(
         self,
@@ -933,6 +991,25 @@ class Relay:
 
         try:
             run = self.get(run_id)
+            try:
+                self._validate_request(
+                    str(run["idempotency_key"]),
+                    run["payload"],
+                )
+            except RequestValidationError as error:
+                with self._provider_coordinator.hold():
+                    report = self._invalid_stored_request_report_locked(
+                        run,
+                        claim_token,
+                        error,
+                    )
+                    self._mark_failed(
+                        run_id,
+                        claim_token,
+                        error,
+                        report,
+                    )
+                raise _OutcomeRecorded(error)
             for index, asset in enumerate(run["payload"]["assets"]):
                 external_key = f"{run_id}:{asset['asset_id']}"
                 with self._provider_coordinator.hold():
