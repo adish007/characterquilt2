@@ -10,7 +10,13 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any, Callable
 
-from relay import ClaimLost, InjectedCrash, Relay, RunClaimed
+from relay import (
+    ClaimLost,
+    IdempotencyConflict,
+    InjectedCrash,
+    Relay,
+    RunClaimed,
+)
 
 
 def payload(*, asset_count: int = 2) -> dict[str, Any]:
@@ -299,6 +305,100 @@ class RunClaimsTest(unittest.TestCase):
         self.assertEqual(len(provider.observations), 1)
         self.assertEqual(len(self.relay.provider.list_objects()), 1)
 
+    def test_claim_time_is_sampled_after_database_lock_is_acquired(self) -> None:
+        run_id = self.submit("contended-claim", asset_count=0)
+        blocker = sqlite3.connect(self.db_path)
+        blocker.execute("BEGIN IMMEDIATE")
+        connection_opened = threading.Event()
+        original_connect = self.relay._connect
+        outcome: list[tuple[str, Any]] = []
+
+        def signaling_connect() -> sqlite3.Connection:
+            connection = original_connect()
+            connection_opened.set()
+            return connection
+
+        def execute() -> None:
+            try:
+                outcome.append(("ok", self.relay.run_once(run_id)))
+            except BaseException as error:
+                outcome.append(("error", error))
+
+        self.relay._connect = signaling_connect  # type: ignore[method-assign]
+        worker = threading.Thread(target=execute)
+        try:
+            worker.start()
+            self.assertTrue(connection_opened.wait(timeout=2))
+            self.clock.advance(self.claim_ttl + 1)
+            blocker.commit()
+            worker.join(timeout=2)
+        finally:
+            blocker.close()
+            self.relay._connect = original_connect  # type: ignore[method-assign]
+            if worker.is_alive():
+                worker.join(timeout=5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(outcome[0][0], "ok", outcome)
+        self.assertEqual(self.relay.get(run_id)["status"], "done")
+
+    def test_expired_claim_cannot_commit_after_waiting_for_database(self) -> None:
+        run_id = self.submit("contended-completion", asset_count=0)
+        claim_token = "contended-token"
+        with closing(sqlite3.connect(self.db_path)) as connection, connection:
+            connection.execute(
+                """
+                UPDATE deployments
+                SET status = 'running', claim_token = ?, claim_expires_at = ?
+                WHERE id = ?
+                """,
+                (claim_token, self.clock() + self.claim_ttl, run_id),
+            )
+
+        blocker = sqlite3.connect(self.db_path)
+        blocker.execute("BEGIN IMMEDIATE")
+        connection_opened = threading.Event()
+        original_connect = self.relay._connect
+        outcome: list[BaseException | str] = []
+
+        def signaling_connect() -> sqlite3.Connection:
+            connection = original_connect()
+            connection_opened.set()
+            return connection
+
+        def complete() -> None:
+            try:
+                self.relay._complete(
+                    run_id,
+                    claim_token,
+                    {"objects": [], "verified": True},
+                )
+            except BaseException as error:
+                outcome.append(error)
+            else:
+                outcome.append("committed")
+
+        self.relay._connect = signaling_connect  # type: ignore[method-assign]
+        worker = threading.Thread(target=complete)
+        try:
+            worker.start()
+            self.assertTrue(connection_opened.wait(timeout=2))
+            self.clock.advance(self.claim_ttl + 1)
+            blocker.commit()
+            worker.join(timeout=2)
+        finally:
+            blocker.close()
+            self.relay._connect = original_connect  # type: ignore[method-assign]
+            if worker.is_alive():
+                worker.join(timeout=5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(outcome), 1)
+        self.assertIsInstance(outcome[0], ClaimLost)
+        run = self.relay.get(run_id)
+        self.assertEqual(run["status"], "running")
+        self.assertIsNone(run["receipt"])
+
     def test_two_workers_cannot_hold_valid_claims_for_one_run(self) -> None:
         run_id = self.submit("single-owner")
         contender = self.new_relay()
@@ -537,6 +637,53 @@ class RunClaimsTest(unittest.TestCase):
         requeued = self.relay.get(run_id)
         self.assertEqual(requeued["status"], "pending")
         self.assertEqual(requeued["error"], run["error"])
+
+    def test_provider_identity_conflict_is_terminal(self) -> None:
+        request = payload(asset_count=1)
+        run_id = self.relay.submit("provider-conflict", request).run_id
+        conflicting_asset = dict(request["assets"][0])
+        conflicting_asset["source_sha256"] = "different-content"
+        self.relay.provider.create_draft(
+            external_key=f"{run_id}:{conflicting_asset['asset_id']}",
+            asset=conflicting_asset,
+        )
+
+        with self.assertRaises(IdempotencyConflict):
+            self.relay.run_once(run_id)
+
+        run = self.relay.get(run_id)
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(run["error"]["type"], "IdempotencyConflict")
+        self.assertFalse(run["error"]["retryable"])
+        self.assertIsNone(run["receipt"])
+        self.assertEqual(raw_claim(self.db_path, run_id), (None, None))
+        with self.assertRaisesRegex(RuntimeError, "terminally failed"):
+            self.relay.retry(run_id)
+
+    def test_retryable_error_clears_stale_success_receipt(self) -> None:
+        run_id = self.submit("stale-receipt", asset_count=1)
+        self.relay.run_once(run_id)
+        with closing(sqlite3.connect(self.db_path)) as connection, connection:
+            connection.execute(
+                """
+                UPDATE deployments
+                SET status = 'pending', claim_token = NULL,
+                    claim_expires_at = NULL
+                WHERE id = ?
+                """,
+                (run_id,),
+            )
+        self.relay.provider = FailingProvider(self.relay.provider)
+
+        with self.assertRaises(RuntimeError):
+            self.relay.run_once(run_id)
+
+        run = self.relay.get(run_id)
+        self.assertEqual(run["status"], "retryable")
+        self.assertIsNone(run["receipt"])
+        summary = self.relay.deployment_summary(run_id)
+        self.assertFalse(summary["verified"])
+        self.assertEqual(summary["objects_deployed"], 0)
 
     def test_poison_run_does_not_block_later_pending_work(self) -> None:
         poison_id = self.submit("poison")

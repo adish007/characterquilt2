@@ -433,8 +433,9 @@ class Relay:
         return run_id
 
     def _renew_claim(self, run_id: str, claim_token: str) -> None:
-        now = float(self._clock())
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now = float(self._clock())
             cursor = connection.execute(
                 """
                 UPDATE deployments
@@ -452,30 +453,36 @@ class Relay:
             if cursor.rowcount != 1:
                 raise ClaimLost(f"claim for run {run_id!r} is no longer active")
 
-    def _mark_retryable(
+    def _record_error(
         self,
         run_id: str,
         claim_token: str,
         error: Exception,
     ) -> None:
-        now = float(self._clock())
+        is_terminal = isinstance(
+            error,
+            (IdempotencyConflict, RequestValidationError),
+        )
+        status = "failed" if is_terminal else "retryable"
         error_json = _canonical_json(
             {
                 "type": type(error).__name__,
                 "message": str(error),
-                "retryable": True,
+                "retryable": not is_terminal,
             }
         )
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now = float(self._clock())
             cursor = connection.execute(
                 """
                 UPDATE deployments
-                SET status = 'retryable', error_json = ?,
+                SET status = ?, error_json = ?, receipt_json = NULL,
                     claim_token = NULL, claim_expires_at = NULL
                 WHERE id = ? AND status = 'running'
                     AND claim_token = ? AND claim_expires_at > ?
                 """,
-                (error_json, run_id, claim_token, now),
+                (status, error_json, run_id, claim_token, now),
             )
             if cursor.rowcount != 1:
                 raise ClaimLost(f"claim for run {run_id!r} is no longer active")
@@ -486,8 +493,9 @@ class Relay:
         claim_token: str,
         receipt: dict[str, Any],
     ) -> None:
-        now = float(self._clock())
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now = float(self._clock())
             cursor = connection.execute(
                 """
                 UPDATE deployments
@@ -508,9 +516,9 @@ class Relay:
         crash_at: str | None = None,
     ) -> dict[str, Any]:
         claim_token = str(uuid.uuid4())
-        now = float(self._clock())
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            now = float(self._clock())
             row = connection.execute(
                 """
                 SELECT status, receipt_json, claim_token, claim_expires_at
@@ -611,7 +619,7 @@ class Relay:
             raise
         except Exception as error:
             try:
-                self._mark_retryable(run_id, claim_token, error)
+                self._record_error(run_id, claim_token, error)
             except ClaimLost as claim_error:
                 raise claim_error from error
             raise

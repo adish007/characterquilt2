@@ -387,14 +387,17 @@ class RequestContractTest(unittest.TestCase):
         )
         provider_before_recovery = self.relay.provider.list_objects()
 
-        with self.assertRaises(RequestValidationError):
-            self.relay.recover()
+        self.relay.recover()
 
         self.assertEqual(
             self.relay.provider.list_objects(),
             provider_before_recovery,
         )
-        self.assertEqual(self.relay.get("legacy-invalid")["status"], "running")
+        run = self.relay.get("legacy-invalid")
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(run["error"]["type"], "RequestValidationError")
+        self.assertFalse(run["error"]["retryable"])
+        self.assertIsNone(run["receipt"])
 
     def test_concurrent_same_key_submission_creates_one_run(self) -> None:
         worker_count = 6
