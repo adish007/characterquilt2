@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -50,21 +51,67 @@ class _ClosingConnection(sqlite3.Connection):
 class _ProviderCoordinator:
     """Serialize the provider's whole-file operations across relay processes."""
 
+    _registry_guard = threading.Lock()
+    _process_locks: dict[Path, threading.RLock] = {}
+    _held_paths = threading.local()
+
     def __init__(self, state_path: Path) -> None:
-        state_path = Path(state_path)
+        state_path = Path(state_path).resolve()
         self.lock_path = state_path.with_name(f"{state_path.name}.lock")
+        with self._registry_guard:
+            self._process_locks.setdefault(
+                self.lock_path,
+                threading.RLock(),
+            )
+
+    @classmethod
+    def _reset_after_fork(cls) -> None:
+        # A child must not inherit a Python lock or reentrancy record from a
+        # thread that existed only in its parent. The OS advisory lock remains
+        # the cross-process authority.
+        cls._registry_guard = threading.Lock()
+        cls._process_locks = {}
+        cls._held_paths = threading.local()
 
     @contextmanager
     def hold(self) -> Iterator[None]:
-        descriptor = os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        # The process-local RLock covers platforms whose flock ownership is
+        # process-scoped. The depth record makes a coordinated provider facade
+        # safe to call from code that already holds this same provider gate.
+        with self._registry_guard:
+            process_lock = self._process_locks.setdefault(
+                self.lock_path,
+                threading.RLock(),
+            )
+        with process_lock:
+            depths = getattr(self._held_paths, "depths", None)
+            if depths is None:
+                depths = {}
+                self._held_paths.depths = depths
+            depth = int(depths.get(self.lock_path, 0))
+            if depth:
+                depths[self.lock_path] = depth + 1
+                try:
+                    yield
+                finally:
+                    depths[self.lock_path] -= 1
+                return
+
+            descriptor = os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o600)
             try:
-                yield
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                depths[self.lock_path] = 1
+                try:
+                    yield
+                finally:
+                    depths.pop(self.lock_path, None)
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
             finally:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-        finally:
-            os.close(descriptor)
+                os.close(descriptor)
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_ProviderCoordinator._reset_after_fork)
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,6 +187,47 @@ class FakeHubSpot:
         return [dict(value) for value in self._load().values()]
 
 
+class _CoordinatedProvider:
+    """Expose provider operations only through the relay-owned gate."""
+
+    DISPLAY_NAME_LIMIT = FakeHubSpot.DISPLAY_NAME_LIMIT
+
+    def __init__(
+        self,
+        delegate: FakeHubSpot,
+        coordinator: _ProviderCoordinator,
+    ) -> None:
+        self._delegate = delegate
+        self._coordinator = coordinator
+        self.state_path = delegate.state_path
+
+    @contextmanager
+    def _hold_backend(self) -> Iterator[Any]:
+        """Yield the backend for one already-coordinated operation group."""
+        with self._coordinator.hold():
+            yield self._delegate
+
+    def create_draft(
+        self,
+        *,
+        external_key: str,
+        asset: dict[str, Any],
+    ) -> dict[str, str]:
+        with self._hold_backend() as provider:
+            return provider.create_draft(
+                external_key=external_key,
+                asset=asset,
+            )
+
+    def read(self, external_key: str) -> dict[str, str]:
+        with self._hold_backend() as provider:
+            return provider.read(external_key)
+
+    def list_objects(self) -> list[dict[str, str]]:
+        with self._hold_backend() as provider:
+            return provider.list_objects()
+
+
 class Relay:
     def __init__(
         self,
@@ -155,13 +243,22 @@ class Relay:
         provider_state_path = Path(provider_state_path).resolve()
         self._provider_coordinator = _ProviderCoordinator(provider_state_path)
         if provider_state_path.exists():
-            self.provider = FakeHubSpot(provider_state_path)
+            raw_provider = FakeHubSpot(provider_state_path)
         else:
             with self._provider_coordinator.hold():
-                self.provider = FakeHubSpot(provider_state_path)
+                raw_provider = FakeHubSpot(provider_state_path)
+        self._provider = _CoordinatedProvider(
+            raw_provider,
+            self._provider_coordinator,
+        )
         self._clock = clock or time.time
         self.claim_ttl_seconds = float(claim_ttl_seconds)
         self._init_db()
+
+    @property
+    def provider(self) -> _CoordinatedProvider:
+        """The provider surface coordinated by this relay."""
+        return self._provider
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
@@ -376,17 +473,41 @@ class Relay:
         return result
 
     def cancel(self, run_id: str) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                "UPDATE deployments SET status = 'cancelled' WHERE id = ?",
-                (run_id,),
-            )
+        # Cancellation invalidates ownership. Joining the provider gate means
+        # acknowledgement cannot race between a successful renewal and the
+        # provider call that renewal authorized.
+        with self._provider_coordinator.hold():
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT status FROM deployments WHERE id = ?",
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(run_id)
+                if str(row["status"]) in {"done", "failed", "cancelled"}:
+                    return
+                cursor = connection.execute(
+                    """
+                    UPDATE deployments
+                    SET status = 'cancelled', claim_token = NULL,
+                        claim_expires_at = NULL, receipt_json = NULL
+                    WHERE id = ?
+                        AND status IN ('pending', 'running', 'retryable')
+                    """,
+                    (run_id,),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError(
+                        f"run {run_id!r} could not be cancelled"
+                    )
 
     def retry(self, run_id: str) -> str:
         """Return the same logical run, requeuing only unfinished work."""
+        # Preserve the prompt active-owner response without waiting behind its
+        # provider call. A second check under the gate remains authoritative.
         with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
+            observed = connection.execute(
                 """
                 SELECT status, claim_token, claim_expires_at
                 FROM deployments
@@ -394,42 +515,66 @@ class Relay:
                 """,
                 (run_id,),
             ).fetchone()
-            if row is None:
-                raise KeyError(run_id)
+        if observed is None:
+            raise KeyError(run_id)
+        observed_now = float(self._clock())
+        if (
+            str(observed["status"]) == "running"
+            and observed["claim_token"] is not None
+            and observed["claim_expires_at"] is not None
+            and float(observed["claim_expires_at"]) > observed_now
+        ):
+            raise RunClaimed(f"run {run_id!r} has an active claim")
 
-            status = str(row["status"])
-            if status == "done":
-                return run_id
-            if status == "cancelled":
-                raise RunCancelled(run_id)
-            if status == "failed":
-                raise RuntimeError(f"run {run_id!r} is terminally failed")
+        # Requeueing an expired run invalidates its old claim, so it observes
+        # the same gate order as claim takeover and provider execution.
+        with self._provider_coordinator.hold():
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    """
+                    SELECT status, claim_token, claim_expires_at
+                    FROM deployments
+                    WHERE id = ?
+                    """,
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(run_id)
 
-            now = float(self._clock())
-            claim_is_active = (
-                status == "running"
-                and row["claim_token"] is not None
-                and row["claim_expires_at"] is not None
-                and float(row["claim_expires_at"]) > now
-            )
-            if claim_is_active:
-                raise RunClaimed(f"run {run_id!r} has an active claim")
-            if status not in {"pending", "retryable", "running"}:
-                raise RuntimeError(
-                    f"run {run_id!r} in state {status!r} cannot be retried"
+                status = str(row["status"])
+                if status == "done":
+                    return run_id
+                if status == "cancelled":
+                    raise RunCancelled(run_id)
+                if status == "failed":
+                    raise RuntimeError(f"run {run_id!r} is terminally failed")
+
+                now = float(self._clock())
+                claim_is_active = (
+                    status == "running"
+                    and row["claim_token"] is not None
+                    and row["claim_expires_at"] is not None
+                    and float(row["claim_expires_at"]) > now
                 )
+                if claim_is_active:
+                    raise RunClaimed(f"run {run_id!r} has an active claim")
+                if status not in {"pending", "retryable", "running"}:
+                    raise RuntimeError(
+                        f"run {run_id!r} in state {status!r} cannot be retried"
+                    )
 
-            cursor = connection.execute(
-                """
-                UPDATE deployments
-                SET status = 'pending', claim_token = NULL,
-                    claim_expires_at = NULL
-                WHERE id = ?
-                """,
-                (run_id,),
-            )
-            if cursor.rowcount != 1:
-                raise RuntimeError(f"failed to requeue run {run_id!r}")
+                cursor = connection.execute(
+                    """
+                    UPDATE deployments
+                    SET status = 'pending', claim_token = NULL,
+                        claim_expires_at = NULL
+                    WHERE id = ?
+                    """,
+                    (run_id,),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError(f"failed to requeue run {run_id!r}")
         return run_id
 
     def _renew_claim(self, run_id: str, claim_token: str) -> None:
@@ -509,17 +654,17 @@ class Relay:
             if cursor.rowcount != 1:
                 raise ClaimLost(f"claim for run {run_id!r} is no longer active")
 
-    def run_once(
+    def _acquire_claim(
         self,
         run_id: str,
-        *,
-        crash_at: str | None = None,
-    ) -> dict[str, Any]:
-        claim_token = str(uuid.uuid4())
+        claim_token: str,
+    ) -> dict[str, Any] | None:
+        # Do not make an ordinary contender wait for the active worker's
+        # provider call merely to learn that the run is already claimed. This
+        # observation never grants ownership; the gated transaction below is
+        # still the only acquisition authority.
         with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            now = float(self._clock())
-            row = connection.execute(
+            observed = connection.execute(
                 """
                 SELECT status, receipt_json, claim_token, claim_expires_at
                 FROM deployments
@@ -527,58 +672,97 @@ class Relay:
                 """,
                 (run_id,),
             ).fetchone()
-            if row is None:
-                raise KeyError(run_id)
+        if observed is None:
+            raise KeyError(run_id)
+        observed_status = str(observed["status"])
+        observed_now = float(self._clock())
+        if (
+            observed_status == "running"
+            and observed["claim_token"] is not None
+            and observed["claim_expires_at"] is not None
+            and float(observed["claim_expires_at"]) > observed_now
+        ):
+            raise RunClaimed(f"run {run_id!r} has an active claim")
 
-            status = str(row["status"])
-            if status == "done":
-                if row["receipt_json"] is None:
-                    raise RuntimeError(f"done run {run_id!r} has no receipt")
-                return json.loads(str(row["receipt_json"]))
-            if status == "cancelled":
-                raise RunCancelled(run_id)
-            if status == "failed":
-                raise RuntimeError(f"run {run_id!r} is terminally failed")
+        # Claim replacement uses the same gate as provider calls. Therefore an
+        # expired owner that already passed its gated renewal cannot be
+        # replaced in the scheduling gap before that provider call begins.
+        with self._provider_coordinator.hold():
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                now = float(self._clock())
+                row = connection.execute(
+                    """
+                    SELECT status, receipt_json, claim_token, claim_expires_at
+                    FROM deployments
+                    WHERE id = ?
+                    """,
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(run_id)
 
-            claim_is_active = (
-                status == "running"
-                and row["claim_token"] is not None
-                and row["claim_expires_at"] is not None
-                and float(row["claim_expires_at"]) > now
-            )
-            if claim_is_active:
-                raise RunClaimed(f"run {run_id!r} has an active claim")
-            if status not in {"pending", "retryable", "running"}:
-                raise RuntimeError(
-                    f"run {run_id!r} in state {status!r} cannot be executed"
+                status = str(row["status"])
+                if status == "done":
+                    if row["receipt_json"] is None:
+                        raise RuntimeError(f"done run {run_id!r} has no receipt")
+                    return json.loads(str(row["receipt_json"]))
+                if status == "cancelled":
+                    raise RunCancelled(run_id)
+                if status == "failed":
+                    raise RuntimeError(f"run {run_id!r} is terminally failed")
+
+                claim_is_active = (
+                    status == "running"
+                    and row["claim_token"] is not None
+                    and row["claim_expires_at"] is not None
+                    and float(row["claim_expires_at"]) > now
                 )
+                if claim_is_active:
+                    raise RunClaimed(f"run {run_id!r} has an active claim")
+                if status not in {"pending", "retryable", "running"}:
+                    raise RuntimeError(
+                        f"run {run_id!r} in state {status!r} cannot be executed"
+                    )
 
-            cursor = connection.execute(
-                """
-                UPDATE deployments
-                SET status = 'running', claim_token = ?, claim_expires_at = ?
-                WHERE id = ?
-                    AND (
-                        status IN ('pending', 'retryable')
-                        OR (
-                            status = 'running'
-                            AND (
-                                claim_token IS NULL
-                                OR claim_expires_at IS NULL
-                                OR claim_expires_at <= ?
+                cursor = connection.execute(
+                    """
+                    UPDATE deployments
+                    SET status = 'running', claim_token = ?, claim_expires_at = ?
+                    WHERE id = ?
+                        AND (
+                            status IN ('pending', 'retryable')
+                            OR (
+                                status = 'running'
+                                AND (
+                                    claim_token IS NULL
+                                    OR claim_expires_at IS NULL
+                                    OR claim_expires_at <= ?
+                                )
                             )
                         )
-                    )
-                """,
-                (
-                    claim_token,
-                    now + self.claim_ttl_seconds,
-                    run_id,
-                    now,
-                ),
-            )
-            if cursor.rowcount != 1:
-                raise RunClaimed(f"run {run_id!r} could not be claimed")
+                    """,
+                    (
+                        claim_token,
+                        now + self.claim_ttl_seconds,
+                        run_id,
+                        now,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RunClaimed(f"run {run_id!r} could not be claimed")
+        return None
+
+    def run_once(
+        self,
+        run_id: str,
+        *,
+        crash_at: str | None = None,
+    ) -> dict[str, Any]:
+        claim_token = str(uuid.uuid4())
+        existing_receipt = self._acquire_claim(run_id, claim_token)
+        if existing_receipt is not None:
+            return existing_receipt
 
         try:
             run = self.get(run_id)
@@ -592,9 +776,9 @@ class Relay:
             readbacks: list[dict[str, str]] = []
             for index, asset in enumerate(run["payload"]["assets"]):
                 external_key = f"{run_id}:{asset['asset_id']}"
-                with self._provider_coordinator.hold():
+                with self.provider._hold_backend() as provider:
                     self._renew_claim(run_id, claim_token)
-                    self.provider.create_draft(
+                    provider.create_draft(
                         external_key=external_key,
                         asset=asset,
                     )
@@ -603,7 +787,7 @@ class Relay:
                             "crashed after provider write and before local receipt"
                         )
                     self._renew_claim(run_id, claim_token)
-                    readbacks.append(self.provider.read(external_key))
+                    readbacks.append(provider.read(external_key))
 
             receipt = {
                 "run_id": run_id,

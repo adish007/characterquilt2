@@ -6,7 +6,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
@@ -196,6 +196,14 @@ class RenewalRecordingProvider(DelegatingProvider):
         return super().read(external_key)
 
 
+def provider_backend(relay: Relay) -> Any:
+    return relay.provider._delegate
+
+
+def install_provider_backend(relay: Relay, provider: Any) -> None:
+    relay.provider._delegate = provider
+
+
 class RunClaimsTest(unittest.TestCase):
     claim_ttl = 10.0
 
@@ -285,12 +293,12 @@ class RunClaimsTest(unittest.TestCase):
         request = payload()
         run_id = self.relay.submit("self-expired", request).run_id
         provider = RenewalRecordingProvider(
-            self.relay.provider,
+            provider_backend(self.relay),
             self.relay,
             self.clock,
             advance_seconds=self.claim_ttl,
         )
-        self.relay.provider = provider
+        install_provider_backend(self.relay, provider)
 
         with self.assertRaises(ClaimLost):
             self.relay.run_once(run_id)
@@ -402,8 +410,8 @@ class RunClaimsTest(unittest.TestCase):
     def test_two_workers_cannot_hold_valid_claims_for_one_run(self) -> None:
         run_id = self.submit("single-owner")
         contender = self.new_relay()
-        blocking = BlockingProvider(self.relay.provider)
-        self.relay.provider = blocking
+        blocking = BlockingProvider(provider_backend(self.relay))
+        install_provider_backend(self.relay, blocking)
 
         with ThreadPoolExecutor(max_workers=1) as executor:
             first = executor.submit(self.relay.run_once, run_id)
@@ -422,12 +430,12 @@ class RunClaimsTest(unittest.TestCase):
         request = payload()
         run_id = self.relay.submit("renewed", request).run_id
         provider = RenewalRecordingProvider(
-            self.relay.provider,
+            provider_backend(self.relay),
             self.relay,
             self.clock,
             advance_seconds=self.claim_ttl * 0.6,
         )
-        self.relay.provider = provider
+        install_provider_backend(self.relay, provider)
 
         self.relay.run_once(run_id)
 
@@ -446,8 +454,8 @@ class RunClaimsTest(unittest.TestCase):
     ) -> None:
         request = payload()
         run_id = self.relay.submit("fenced", request).run_id
-        blocking = BlockingProvider(self.relay.provider)
-        self.relay.provider = blocking
+        blocking = BlockingProvider(provider_backend(self.relay))
+        install_provider_backend(self.relay, blocking)
         replacement = self.new_relay()
 
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -457,11 +465,9 @@ class RunClaimsTest(unittest.TestCase):
             self.clock.advance(self.claim_ttl + 1)
 
             replacement_worker = executor.submit(replacement.run_once, run_id)
-            deadline = time.monotonic() + 2
-            while raw_claim(self.db_path, run_id)[0] == old_claim:
-                if time.monotonic() >= deadline:
-                    self.fail("replacement did not acquire the expired claim")
-                time.sleep(0.01)
+            time.sleep(0.05)
+            self.assertEqual(raw_claim(self.db_path, run_id)[0], old_claim)
+            self.assertFalse(replacement_worker.done())
 
             blocking.release.set()
             with self.assertRaises(ClaimLost):
@@ -477,11 +483,123 @@ class RunClaimsTest(unittest.TestCase):
             len(request["assets"]),
         )
 
+    def test_replacement_cannot_install_between_renewal_and_provider_entry(
+        self,
+    ) -> None:
+        run_id = self.submit("gated-handoff", asset_count=1)
+        counter = CountingProvider(provider_backend(self.relay))
+        install_provider_backend(self.relay, counter)
+        renewed = threading.Event()
+        release = threading.Event()
+        renewal_count = 0
+        original_renew = self.relay._renew_claim
+
+        def pause_after_renewal(run_id: str, claim_token: str) -> None:
+            nonlocal renewal_count
+            original_renew(run_id, claim_token)
+            renewal_count += 1
+            if renewal_count == 1:
+                renewed.set()
+                if not release.wait(timeout=5):
+                    raise TimeoutError("test did not release renewed worker")
+
+        self.relay._renew_claim = pause_after_renewal  # type: ignore[method-assign]
+        replacement = self.new_relay()
+        takeover_attempted = threading.Event()
+        original_hold = replacement._provider_coordinator.hold
+
+        @contextmanager
+        def signaling_hold():
+            takeover_attempted.set()
+            with original_hold():
+                yield
+
+        replacement._provider_coordinator.hold = signaling_hold  # type: ignore[method-assign]
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                old_worker = executor.submit(self.relay.run_once, run_id)
+                self.assertTrue(renewed.wait(timeout=2))
+                old_token, _ = raw_claim(self.db_path, run_id)
+                self.clock.advance(self.claim_ttl + 1)
+
+                new_worker = executor.submit(replacement.run_once, run_id)
+                self.assertTrue(takeover_attempted.wait(timeout=2))
+                self.assertEqual(raw_claim(self.db_path, run_id)[0], old_token)
+                self.assertEqual(counter.operation_count, 0)
+                self.assertFalse(new_worker.done())
+
+                release.set()
+                with self.assertRaises(ClaimLost):
+                    old_worker.result(timeout=2)
+                replacement_receipt = new_worker.result(timeout=2)
+        finally:
+            release.set()
+            self.relay._renew_claim = original_renew  # type: ignore[method-assign]
+            replacement._provider_coordinator.hold = original_hold  # type: ignore[method-assign]
+
+        self.assertEqual(counter.operation_count, 1)
+        self.assertEqual(self.relay.get(run_id)["status"], "done")
+        self.assertEqual(self.relay.get(run_id)["receipt"], replacement_receipt)
+
+    def test_cancellation_waits_for_authorized_provider_section(self) -> None:
+        run_id = self.submit("gated-cancellation", asset_count=1)
+        renewed = threading.Event()
+        release = threading.Event()
+        original_renew = self.relay._renew_claim
+        first_renewal = True
+
+        def pause_after_renewal(run_id: str, claim_token: str) -> None:
+            nonlocal first_renewal
+            original_renew(run_id, claim_token)
+            if first_renewal:
+                first_renewal = False
+                renewed.set()
+                if not release.wait(timeout=5):
+                    raise TimeoutError("test did not release renewed worker")
+
+        self.relay._renew_claim = pause_after_renewal  # type: ignore[method-assign]
+        canceller = self.new_relay()
+        cancellation_attempted = threading.Event()
+        original_hold = canceller._provider_coordinator.hold
+
+        @contextmanager
+        def signaling_hold():
+            cancellation_attempted.set()
+            with original_hold():
+                yield
+
+        canceller._provider_coordinator.hold = signaling_hold  # type: ignore[method-assign]
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                worker = executor.submit(self.relay.run_once, run_id)
+                self.assertTrue(renewed.wait(timeout=2))
+                old_claim = raw_claim(self.db_path, run_id)
+                self.clock.advance(self.claim_ttl + 1)
+
+                cancellation = executor.submit(canceller.cancel, run_id)
+                self.assertTrue(cancellation_attempted.wait(timeout=2))
+                self.assertFalse(cancellation.done())
+                self.assertEqual(raw_claim(self.db_path, run_id), old_claim)
+
+                release.set()
+                with self.assertRaises(ClaimLost):
+                    worker.result(timeout=2)
+                cancellation.result(timeout=2)
+        finally:
+            release.set()
+            self.relay._renew_claim = original_renew  # type: ignore[method-assign]
+            canceller._provider_coordinator.hold = original_hold  # type: ignore[method-assign]
+
+        cancelled = self.relay.get(run_id)
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(raw_claim(self.db_path, run_id), (None, None))
+        self.assertEqual(len(self.relay.provider.list_objects()), 1)
+
     def test_retry_returns_same_run_without_stealing_active_claim(self) -> None:
         run_id = self.submit("active-retry")
         retrier = self.new_relay()
-        blocking = BlockingProvider(self.relay.provider)
-        self.relay.provider = blocking
+        blocking = BlockingProvider(provider_backend(self.relay))
+        install_provider_backend(self.relay, blocking)
 
         with ThreadPoolExecutor(max_workers=1) as executor:
             worker = executor.submit(self.relay.run_once, run_id)
@@ -501,7 +619,10 @@ class RunClaimsTest(unittest.TestCase):
     def test_retry_and_recovery_serialize_on_one_claim(self) -> None:
         request = payload()
         run_id = self.relay.submit("retry-recovery-race", request).run_id
-        self.relay.provider = FailingProvider(self.relay.provider)
+        install_provider_backend(
+            self.relay,
+            FailingProvider(provider_backend(self.relay)),
+        )
         with self.assertRaises(RuntimeError):
             self.relay.run_once(run_id)
 
@@ -525,8 +646,14 @@ class RunClaimsTest(unittest.TestCase):
                     asset=asset,
                 )
 
-        retrier.provider = TrackingProvider(retrier.provider)
-        recoverer.provider = TrackingProvider(recoverer.provider)
+        install_provider_backend(
+            retrier,
+            TrackingProvider(provider_backend(retrier)),
+        )
+        install_provider_backend(
+            recoverer,
+            TrackingProvider(provider_backend(recoverer)),
+        )
         barrier = threading.Barrier(2)
 
         def retry() -> str | RunClaimed:
@@ -559,8 +686,8 @@ class RunClaimsTest(unittest.TestCase):
     def test_completed_run_is_idempotent_without_provider_calls(self) -> None:
         run_id = self.submit("already-done")
         receipt = self.relay.run_once(run_id)
-        counter = CountingProvider(self.relay.provider)
-        self.relay.provider = counter
+        counter = CountingProvider(provider_backend(self.relay))
+        install_provider_backend(self.relay, counter)
 
         replayed_receipt = self.relay.run_once(run_id)
 
@@ -577,8 +704,8 @@ class RunClaimsTest(unittest.TestCase):
                     "UPDATE deployments SET status = ? WHERE id = ?",
                     (status, run_id),
                 )
-        counter = CountingProvider(self.relay.provider)
-        self.relay.provider = counter
+        counter = CountingProvider(provider_backend(self.relay))
+        install_provider_backend(self.relay, counter)
 
         self.relay.recover()
 
@@ -615,7 +742,10 @@ class RunClaimsTest(unittest.TestCase):
         self,
     ) -> None:
         run_id = self.submit("provider-error")
-        self.relay.provider = FailingProvider(self.relay.provider)
+        install_provider_backend(
+            self.relay,
+            FailingProvider(provider_backend(self.relay)),
+        )
 
         with self.assertRaisesRegex(RuntimeError, "provider refused"):
             self.relay.run_once(run_id)
@@ -673,7 +803,10 @@ class RunClaimsTest(unittest.TestCase):
                 """,
                 (run_id,),
             )
-        self.relay.provider = FailingProvider(self.relay.provider)
+        install_provider_backend(
+            self.relay,
+            FailingProvider(provider_backend(self.relay)),
+        )
 
         with self.assertRaises(RuntimeError):
             self.relay.run_once(run_id)
@@ -689,10 +822,13 @@ class RunClaimsTest(unittest.TestCase):
         poison_id = self.submit("poison")
         healthy_request = payload()
         healthy_id = self.relay.submit("healthy", healthy_request).run_id
-        self.relay.provider = FailingProvider(
-            self.relay.provider,
-            should_fail=lambda external_key: external_key.startswith(
-                f"{poison_id}:"
+        install_provider_backend(
+            self.relay,
+            FailingProvider(
+                provider_backend(self.relay),
+                should_fail=lambda external_key: external_key.startswith(
+                    f"{poison_id}:"
+                ),
             ),
         )
 

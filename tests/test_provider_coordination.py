@@ -6,8 +6,10 @@ import os
 import queue
 import sqlite3
 import tempfile
+import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
 from typing import Any
@@ -112,6 +114,69 @@ class BlockingProvider:
         return self.delegate.list_objects()
 
 
+class PausingSaveProvider:
+    """Leave the backing file truncated while a coordinated write is paused."""
+
+    def __init__(self, delegate: Any) -> None:
+        self.delegate = delegate
+        self.truncated = threading.Event()
+        self.release = threading.Event()
+
+    def create_draft(
+        self,
+        *,
+        external_key: str,
+        asset: dict[str, Any],
+    ) -> dict[str, str]:
+        original_save = self.delegate._save
+
+        def pausing_save(objects: dict[str, dict[str, str]]) -> None:
+            self.delegate.state_path.write_text("")
+            self.truncated.set()
+            if not self.release.wait(timeout=5):
+                raise TimeoutError("test did not release provider save")
+            original_save(objects)
+
+        self.delegate._save = pausing_save
+        try:
+            return self.delegate.create_draft(
+                external_key=external_key,
+                asset=asset,
+            )
+        finally:
+            self.delegate._save = original_save
+
+    def read(self, external_key: str) -> dict[str, str]:
+        return self.delegate.read(external_key)
+
+    def list_objects(self) -> list[dict[str, str]]:
+        return self.delegate.list_objects()
+
+
+class BlockingErrorProvider:
+    def __init__(self, delegate: Any) -> None:
+        self.delegate = delegate
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def create_draft(
+        self,
+        *,
+        external_key: str,
+        asset: dict[str, Any],
+    ) -> dict[str, str]:
+        self.entered.set()
+        if not self.release.wait(timeout=5):
+            raise TimeoutError("test did not release failing provider")
+        raise RuntimeError(f"provider refused {external_key}")
+
+    def read(self, external_key: str) -> dict[str, str]:
+        return self.delegate.read(external_key)
+
+    def list_objects(self) -> list[dict[str, str]]:
+        return self.delegate.list_objects()
+
+
 def run_worker(
     db_path: str,
     provider_path: str,
@@ -130,7 +195,10 @@ def run_worker(
         claim_ttl_seconds=claim_ttl_seconds,
     )
     if probe is not None:
-        relay.provider = BlockingProvider(relay.provider, *probe)
+        relay.provider._delegate = BlockingProvider(
+            relay.provider._delegate,
+            *probe,
+        )
     ready.put(run_id)
     start.wait()
     try:
@@ -274,6 +342,66 @@ class ProviderCoordinationTest(unittest.TestCase):
             process.join(timeout=10)
             self.assertFalse(process.is_alive(), "worker process hung")
             self.assertEqual(process.exitcode, 0)
+
+    def test_public_listing_waits_for_inflight_provider_write(self) -> None:
+        request = payload("coordinated-list", asset_count=1)
+        run_id = self.relay.submit("coordinated-list", request).run_id
+        pausing = PausingSaveProvider(self.relay.provider._delegate)
+        self.relay.provider._delegate = pausing
+        reader = Relay(self.db_path, self.provider_path)
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                writer = executor.submit(self.relay.run_once, run_id)
+                self.assertTrue(pausing.truncated.wait(timeout=2))
+                listing = executor.submit(reader.provider.list_objects)
+                time.sleep(0.05)
+                self.assertFalse(listing.done())
+
+                pausing.release.set()
+                writer.result(timeout=2)
+                objects = listing.result(timeout=2)
+        finally:
+            pausing.release.set()
+
+        self.assertEqual(len(objects), 1)
+        self.assertEqual(objects[0]["external_key"], f"{run_id}:coordinated-list-asset-0")
+        self.assertIsInstance(json.loads(self.provider_path.read_text()), dict)
+
+    def test_provider_error_releases_gate_for_another_run(self) -> None:
+        failing_id = self.relay.submit(
+            "failing-run",
+            payload("failing", asset_count=1),
+        ).run_id
+        healthy_id = self.relay.submit(
+            "healthy-run",
+            payload("healthy", asset_count=1),
+        ).run_id
+        failing = BlockingErrorProvider(self.relay.provider._delegate)
+        self.relay.provider._delegate = failing
+        healthy = Relay(self.db_path, self.provider_path)
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                failed_worker = executor.submit(self.relay.run_once, failing_id)
+                self.assertTrue(failing.entered.wait(timeout=2))
+                healthy_worker = executor.submit(healthy.run_once, healthy_id)
+                time.sleep(0.05)
+                self.assertFalse(healthy_worker.done())
+
+                failing.release.set()
+                with self.assertRaisesRegex(RuntimeError, "provider refused"):
+                    failed_worker.result(timeout=2)
+                healthy_receipt = healthy_worker.result(timeout=2)
+        finally:
+            failing.release.set()
+
+        failed = self.relay.get(failing_id)
+        self.assertEqual(failed["status"], "retryable")
+        self.assertEqual(failed["error"]["type"], "RuntimeError")
+        self.assertEqual(healthy_receipt, self.relay.get(healthy_id)["receipt"])
+        self.assertEqual(self.relay.get(healthy_id)["status"], "done")
+        self.assertIsInstance(json.loads(self.provider_path.read_text()), dict)
 
     def test_process_exit_releases_provider_gate(self) -> None:
         entered = self.context.Event()
@@ -475,12 +603,8 @@ class ProviderCoordinationTest(unittest.TestCase):
 
             clock.advance(ttl + 1)
             new_start.set()
-            wait_until(
-                lambda: (
-                    raw_claim(self.db_path, run_id)[0] is not None
-                    and raw_claim(self.db_path, run_id)[0] != old_token
-                )
-            )
+            time.sleep(0.2)
+            self.assertEqual(raw_claim(self.db_path, run_id)[0], old_token)
             release.set()
 
             old_result = collect(old_outcomes, 1)[0]
