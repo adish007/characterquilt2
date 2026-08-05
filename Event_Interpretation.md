@@ -103,8 +103,18 @@ ship, an operator can still see 8 drafts for 4 approved assets with no way to le
 legitimate second campaign is invisible to us and blocks real work. So do not block c3.
 
 *Authorizes:* **a disclosure, not a repair.** Flag a submission whose `payload_hash` matches a prior
-key's and surface the earlier run. Detection is one `GROUP BY idempotency_key` over columns that
-already exist. Nothing irreversible; the operator decides.
+run carrying a *different* key, and surface the earlier run. Nothing irreversible; the operator
+decides.
+
+The query has to group by `payload_hash`, not by `idempotency_key` — grouping by key finds c2 and is
+blind to c3 by construction, since c3's whole shape is *different* keys:
+
+```
+GROUP BY idempotency_key  HAVING COUNT(*)>1                    -> [('deploy-202', 2)]   c2 only
+GROUP BY payload_hash     HAVING COUNT(DISTINCT idem_key)>1    -> [('2ad2ddaf', 3)]     finds c3
+```
+
+Both columns already exist in the schema.
 
 ---
 
@@ -165,16 +175,35 @@ status, and neither its opening UPDATE (`:185-190`) nor its terminal UPDATE (`:2
 `running→done`, `done→done`, `cancelled→done`, `failed→done`, 5/5. And `RunCancelled` is declared at
 `:19` and exported, with zero raise sites. The cancellation feature was never implemented.
 
-*Authorizes:* guarded conditional UPDATEs with rowcount checks, plus a status re-read before each
-provider write. Note what it does **not** authorize: `recover()` re-reading status does not fix it
-(25/25 still `done`); the guard has to live in `run_once`.
+*Authorizes:* guarded conditional UPDATEs with rowcount checks, **and permission to begin a provider
+call coordinated atomically with cancellation acknowledgement** — the same process-safe gate or
+state transition that Cluster A's serialisation uses.
+
+A bare status re-read before each write is **not sufficient**, and saying it is would ship a symptom
+fix described as a cause fix. The re-read leaves a window:
+
+1. the worker reads "not cancelled";
+2. cancellation is durably recorded and acknowledged to the operator;
+3. the worker begins the provider call.
+
+`contract.md:44` promises that after cancellation is durably recorded and acknowledged, **no new
+provider call begins** — which requires the check and the begin-write to be one indivisible step,
+not two. Guarded terminal UPDATEs are still required on top, to stop the terminal write overwriting
+`cancelled` with `done`.
+
+Note what this case does **not** authorize: `recover()` re-reading status does not fix it (25/25
+still `done`); the guard has to live in `run_once`.
 
 ---
 
-### c7 — "receipt said verified; the drafts were not what we approved." **Confirmed, deterministic.** Clusters E + D.
+### c7 — "receipt said verified; the drafts were not what we approved." **Mechanism confirmed; historical attribution inferred.** Clusters E + D.
 
 *Recorded:* `provider_write` run-11; `receipt` `verified: true, objects: 4`; operator note.
 The log does not say **which** fields differed. That gap is filled by the fixture, not the log.
+
+The mechanism below is deterministic and needs no crash and no concurrency. What it is **not** is a
+proof of history: the log records only that the drafts were wrong, so attributing c7 to display-name
+normalisation is an inference from the fixture, well-supported but not recorded.
 
 *Reproduced with no crash, no concurrency and no injected damage* — a single clean run of the
 shipped main fixture:
@@ -219,40 +248,50 @@ objects, Cluster D asserts success anyway. Under multi-run concurrency we measur
 `done` + `verified: true` + `all_present: true` with objects permanently absent, unhealable because
 `recover()` only scans `status='running'`.
 
-**Fact 3 — the two are not causally linked in this codebase.** This is the finding that changes the
-reading. Two workers on the *same* run both call `run_once`, which writes **all** assets. Identical
-key sets means the union is complete and no loss is possible:
+**Fact 3 — the mechanism that loses the object is unsafe provider access, not the double claim
+itself.** A double claim is neither sufficient nor necessary for the shortfall.
+
+*Not sufficient, when both workers finish.* Two workers on the same run both call `run_once`, which
+writes **all** assets. Identical key sets means the union is complete:
 
 ```
-TWO workers, SAME run, both writing ALL assets, 200 trials, A=4:
+TWO workers, SAME run, both writing ALL assets to completion, 200 trials, A=4:
   final provider object count -> {4: 200}        <- never short
 ```
 
-So a same-run double claim **cannot** produce c8's count of 3. That number requires writes from a
-*different* run interleaving — which the log does not record.
-
-The only way two same-run workers produce a shortfall is if they split the work, which is what the
-log's two `provider_write` lines superficially suggest and which `run_once` does not do:
+*But sufficient when one of them stops.* If a worker captures a stale snapshot, saves it after the
+other has committed, and then stalls or dies, the redundancy that healed the case above never
+happens:
 
 ```
-TWO workers, SAME run, DISJOINT asset halves (the log's apparent shape), 200 trials:
-  final provider object count -> {2: 175, 3: 9, unreadable: 16}
-  trials ending SHORT of A: 184/200        c8's count of 3 reachable: YES
+TWO workers, SAME run; B saves a stale snapshot after A completes, then stops; 30 trials:
+  (provider_held, receipt_objects, verified) -> {(1, 4, True): 30}
 ```
 
-*So which is it?* Either the log records only a sample of each worker's writes (both wrote all four,
-and the shortfall came from another run) — or work was split in a way this code does not do. **The
-log cannot distinguish these, and it has no timestamps**, so we cannot show the two `worker_claim`
-lines and the shortfall are even the same episode rather than two adjacent facts.
+Every trial is c8's shape: the receipt claims `A` objects and says `verified: true`, the destination
+holds fewer. So a same-run double claim **can** produce c8, and the earlier `{4: 200}` result says
+only that it does not do so when both workers run to completion. The log never says both completed.
 
-*Consequence for step 4, and it saves work:* **a worker lease is not the fix for the missing
-drafts.** Measured 200/200 here, 60/60 by the agents. Serialising provider access (Cluster A) is.
-Keep the claim — `contract.md:37-38` needs it for fencing and to make cancellation meaningful — but
-do not credit it with c8's count, or the missing objects will survive the repair.
+*Not necessary either.* The same shortfall arises with no double claim at all, from writes by a
+*different* run interleaving — measured under multi-run concurrency.
 
-*Authorizes:* (i) inter-process serialisation of provider access — the multi-process point matters,
-since `stress.py` is thread-only and threads understate it (30% stranded vs 22%); (ii) live audit
-against current provider state; (iii) durable claim + fencing, authorized by Fact 1 alone.
+*What follows.* A claim removes the same-run version of this schedule. It does **not** remove the
+cross-run version, because different runs still share one provider. Serialising provider access
+(Cluster A) removes both. And the log, having no timestamps, cannot establish which interleaving
+actually occurred historically — we can show the code produces the shape, not that this is how it
+happened.
+
+*Consequence for step 4:* both repairs are authorized, but they are not interchangeable, and the
+claim must not be credited with the whole of c8. Ship the claim alone and the cross-run loss
+survives.
+
+*Authorizes:* (i) **process-safe serialisation around provider operations** — the multi-process point
+matters, since `stress.py` is thread-only and threads understate it (30% stranded vs 22%). This is
+the repair that removes both torn reads and lost updates, and it goes **around** the provider, not
+inside it: `TASK.md` says the provider is not ours to change. Note that atomic replacement of the
+state file would be both a modification of the provider *and* insufficient — it stops tearing and
+leaves lost updates untouched. (ii) live audit against current provider state; (iii) durable claim
++ fencing, authorized by Fact 1 alone, which additionally removes the same-run schedule above.
 
 ---
 
@@ -283,10 +322,23 @@ missing `display_name`.
 
 *Two natural triggers worth citing over the constructed ones.* First, a corrupt provider state file
 (Cluster A feeding Cluster F): measured 13/60 trials at W=24, after which `recover()` raises the
-identical `JSONDecodeError` forever and 16 of 24 rows sit stranded. Second, **a human editing one
-draft in HubSpot**: replay then raises `IdempotencyConflict` on every attempt, 3/3, while `audit()`
-still reports `{'all_present': True, 'verified': True}`. That second one needs no crash and no
-concurrency, and it means a *successful* run can become a permanent poison pill.
+identical `JSONDecodeError` forever and 16 of 24 rows sit stranded. Second, **provider-side drift** —
+a human editing one draft in HubSpot — after which replay raises `IdempotencyConflict` on every
+attempt, 3/3, while `audit()` still reports `{'all_present': True, 'verified': True}`.
+
+*Correction on that second trigger, which we earlier overstated.* An edited draft does **not**
+automatically poison recovery. `recover()` scans `status='running'` only, so a completed run is
+never revisited:
+
+```
+row status: done  ->  recover() returned cleanly (done rows are NOT scanned)
+```
+
+The earlier demonstration forced rows to `running` first, which is a precondition, not a
+consequence. Drift becomes poison only when the row is reopened or re-executed — by the retry
+button, by a claim expiring, or by the edit landing *before* a replaying run completes. That is a
+narrower and more honest claim, and it is still a real one: every path that reopens a completed run
+is a path into permanent `IdempotencyConflict`.
 
 *Second, independent mechanism inside the same complaint.* "Never deployed anything" also happens
 with no poison at all: `recover()` never drives a `pending` row, so a crash between submit and first
@@ -299,23 +351,40 @@ that cannot succeed must stop being retried forever); recovery scope covering `p
 
 ---
 
-### c10 — gateway timeout, readback found the object. **Ambiguous. Do not repair.**
+### c10 — gateway timeout, readback found the object. **Not an incident; it records behaviour the starter lacks.**
 
 *Recorded:* `provider_write` run-12 `asset-email-002` with `accepted: null`, `error:
 gateway_timeout`, `retryable: true`; then `provider_readback` `found: true`.
 
-*Interpretation.* The write landed and the response was lost; the readback resolved it. That is
-either a **correctly handled transient** or evidence the service has **no retry policy at all** and
-got lucky. The fixture cannot distinguish these, and `run_once` performs no such readback today —
-the recorded readback came from somewhere outside this code path.
+*Interpretation.* The write landed and the response was lost; a readback resolved it. No operator
+complaint attaches to this case — nothing was duplicated and nothing was lost. The outcome was good.
 
-*Recoverability settles it.* Being wrong by leaving it alone costs nothing — a working path stays
-working. Being wrong by "fixing" it risks adding a retry that, under un-repaired Cluster B,
-**duplicates drafts** — turning a non-incident into the operator's loudest complaint.
+*But the starter cannot do what this case records.* `run_once` reads back only on the success path
+(`:203`); if `create_draft` raises, the exception propagates and no readback is attempted. Measured,
+with a provider that commits the write and then raises `gateway_timeout`:
 
-*Authorizes:* nothing to repair. It does authorize a *contract clause* — `contract.md:28`'s
-retryable/unknown state — because c10 is the shape of an ambiguous outcome that must not be reported
-as success. Sequence, not repair.
+```
+run_once raised TimeoutError; no readback attempted
+provider actually holds: 1        <- the write DID land
+SQL status: running | receipt: None
+```
+
+The row sits in `running`, the receipt is absent, and the accepted write is invisible: not reported
+as success, not reported as unknown, not reconciled by anything. The readback in c10's log came from
+outside this code path.
+
+*So c10 authorizes real work* — not because something broke, but because the recorded good behaviour
+is behaviour the relay does not have:
+
+- a **stable effect identity**, so a repeat of an ambiguous call cannot land as a second draft;
+- a **readback after an ambiguous response**, to resolve whether the write was accepted;
+- a **visible retryable/unknown outcome** when readback cannot resolve it (`contract.md:28`);
+- **no blind retry under a new identity**.
+
+*Sequencing is the safety condition.* This must land **after** request idempotency (c2/c4/c5), or a
+retry added under un-repaired Cluster B amplifies the operator's loudest complaint — turning a
+non-incident into duplicate drafts. That ordering is the reason this case is easy to mis-scope in
+either direction: "do not repair" understates it, and repairing it first would be actively harmful.
 
 ---
 
@@ -346,14 +415,14 @@ The governing table for step 4. A repair with an empty authorizing column does n
 | Reject repeated key with differing `payload_hash` | c5 | cause |
 | `retry()` resumes the same run and provider namespace | c4 | cause |
 | Recovery scope covers `pending` | c4, c9 | cause |
-| Guarded conditional UPDATEs + status re-read before each write | c6 | cause |
-| Inter-process serialisation of provider access | c8 (Fact 2) | cause |
-| Atomic publish (tmp + `os.replace`) of provider state | c8, c9 (corrupt-file trigger) | cause |
+| Guarded UPDATEs + begin-write coordinated atomically with cancel-ack | c6 | cause |
+| Process-safe serialisation **around** provider operations | c8 (Fact 3), c9 (corrupt-file trigger) | cause — removes torn reads *and* lost updates |
 | Readback reconciliation; `verified` means *reconciled* | c7, c8 | cause |
 | Live audit against current provider state | c7, c8 | **symptom detection** — finds drift, cannot prevent it |
 | Per-row isolation in `recover()` + terminal `failed` + attempt counter | c9 | cause |
-| Durable claim + fencing | c8 (Fact 1) | cause — but **not** of the missing objects |
-| Duplicate-payload disclosure across different keys | c3 | disclosure only |
+| Durable claim + fencing | c8 (Fact 1) | cause of the same-run schedule only — **not** of cross-run loss |
+| Readback after an ambiguous response + retryable/unknown outcome | c10 | cause — **sequence after** c2/c4/c5 |
+| Duplicate-payload disclosure across different keys (group by `payload_hash`) | c3 | disclosure only |
 | Same-run replay idempotence regression test | c1 | guard on the c2/c4 repair |
 
 **Deliberate non-repairs, with reasons:**
@@ -361,9 +430,10 @@ The governing table for step 4. A repair with an empty authorizing column does n
 | Not doing | Why |
 |---|---|
 | Anything for c11 | No tool layer exists; unrelated to every operator complaint |
-| Anything for c10 | Undecidable from the evidence; a retry risks amplifying Cluster B |
 | Blocking c3 | Correct behaviour under `contract.md:10`; blocking fails unrecoverably |
-| A lease as the fix for missing drafts | Measured 200/200 zero loss from same-run double claims |
+| Modifying the provider's storage (tmp-file + `os.replace`) | `TASK.md`: the provider is not ours to change. Also insufficient — it stops tearing and leaves lost updates |
+| A claim as the *whole* fix for missing drafts | It removes only the same-run schedule; different runs still share one provider |
+| A blind retry on ambiguous responses | Safe only after c2/c4/c5; before that it amplifies Cluster B |
 | WAL / SQLite tuning | `busy_timeout` is already 5000; `OperationalError` count across every trial: **0** |
 | Validating `destination` / `mode: "published"` | Real (agent2), tied to no operator complaint |
 | Canonical-JSON key ordering, `str()` coercion, unicode graphemes, `object_id` collision math | Real and deterministic; tied to no case and no complaint |
@@ -374,8 +444,10 @@ The governing table for step 4. A repair with an empty authorizing column does n
 
 1. **c5 has no recorded outcome** — no status, receipt, or count. We repair it on the strength of the
    contract, not on evidence of harm.
-2. **c8's two facts may not be one episode.** No timestamps, and same-run double claiming provably
-   cannot produce the shortfall (200/200). We report both defects and explicitly decline to link them.
+2. **c8's historical interleaving is unknowable.** Both a same-run schedule (where one worker saves a
+   stale snapshot and stops) and cross-run interference reproduce the shape; with no timestamps the
+   log cannot say which occurred, or whether both `worker_claim` lines and the shortfall are even the
+   same episode. We report both defects, authorize both repairs, and decline to claim a history.
 3. **c9's trigger is unknown.** `payload_version: "C"` is undefined and no error string was recorded.
    We claim the payload-agnostic mechanism and cite the natural triggers, not the constructed probe.
 4. **c9's "never deployed anything" has two sufficient mechanisms** — poison-blocking and
