@@ -240,16 +240,16 @@
 
 - The one thing you found yourself rather than took from the agent:
 
-  I questioned the first explanation of `c8` because it looked like more than
-  one bug. Following that led to separate fixes for workers claiming the same
-  run, concurrent writes losing provider data, and success being reported
-  without checking the current provider state. Also I saw that retrying a run is 
-  different than reexecuting the same run. 
+  I ran stress twice and noticed that one error corresponded to one running row
+  in both runs, while provider state differed—48/48 once and 47/48 once. This
+  showed that SQL status and provider completeness were separate signals. I
+  then challenged `c8` as multiple defects, separating worker ownership,
+  shared-provider corruption, and false verification.
 
 - The claim in this submission you are least sure of, and how you checked it:
 
   The exact handoff when cancellation and a worker happen at the same time. I
-  checked it with a cancellation tests and repeated the full test
+  checked it with cancellation tests and repeated the full test
   suite; those checks pass, but a late review found one rare timing case that I
   documented instead of rushing an unfinished fix.
 
