@@ -39,6 +39,25 @@ Two things the shipped script cannot show you:
 - **`-1` at W=24 means `list_objects()` itself raised.** That is a different and worse failure than
   a short count (§3).
 
+> **Correction — do not read a safe threshold off this table.** The `0.0%` rows are a 10-trial
+> artifact. At 100 trials, W=2 end-to-end already fails 2/100; and the provider *in isolation* (two
+> writers entering `create_draft` together) loses an object in **98/100** trials:
+> ```
+> PROVIDER IN ISOLATION, 100 trials       END-TO-END via run_once, 100 trials
+>   writers=1 -> {1: 100}                   workers=2 -> {8: 98, 5: 1, unreadable: 1}
+>   writers=2 -> {1: 98, 2: 2}              workers=4 -> {16: 91, 15: 2, 14: 1, 13: 1, 12: 5}
+>   writers=4 -> {1: 74, 2: 26}
+>   writers=8 -> {2: 60, 1: 32, 3: 4, unreadable: 4}
+> ```
+> `PYTHONPATH=. python3 <scratch>/mine/twowriters.py`
+> The race is **always** present; low worker counts merely widen the gap between the two provider
+> calls enough that the SQLite work either side usually separates them. **There is no safe
+> concurrency limit** — agent1's provider-isolation table is the evidence for that, not this
+> end-to-end curve, which understates the race at every width.
+
+To be precise about the first bullet: errors do start at W=4 end-to-end, but that is where the race
+becomes *observable*, not where it begins.
+
 SQL across all 990 rows in that sweep: `done/receipt=True: 772`, `running/receipt=False: 218` —
 **22% of runs strand in `running` with no receipt.**
 

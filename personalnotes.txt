@@ -53,3 +53,14 @@ Retrying a run is different than reexecuting the same run. We get 4 workers more
 just gives us four still
 
 
+
+
+
+  1. Now: Record case hypotheses and identify which cases authorize each repair.
+  2. Implement: Write failing contract tests, make repairs, and mutation-test each cause.
+  3. At the end: Produce the final c1–c11 table showing:
+      - observed behavior;
+      - confirmed cause or healthy behavior;
+      - responsible repair/check;
+      - cause versus symptom detection;
+      - remaining uncertainty.
