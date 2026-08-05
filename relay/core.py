@@ -4,6 +4,7 @@ import hashlib
 import json
 import sqlite3
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -16,8 +17,19 @@ class IdempotencyConflict(RuntimeError):
     pass
 
 
+class RequestValidationError(ValueError):
+    pass
+
+
 class RunCancelled(RuntimeError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class SubmissionResult:
+    run_id: str
+    replayed: bool
+    matching_payload_run_ids: tuple[str, ...]
 
 
 def _canonical_json(value: Any) -> str:
@@ -111,13 +123,133 @@ class Relay:
                 )
                 """
             )
+            duplicate_keys = connection.execute(
+                """
+                SELECT idempotency_key, COUNT(*) AS uses
+                FROM deployments
+                GROUP BY idempotency_key
+                HAVING COUNT(*) > 1
+                ORDER BY idempotency_key
+                """
+            ).fetchall()
+            if duplicate_keys:
+                details = ", ".join(
+                    f"{row['idempotency_key']!r} ({row['uses']} rows)"
+                    for row in duplicate_keys
+                )
+                raise RuntimeError(
+                    "cannot enforce idempotency-key uniqueness; resolve "
+                    f"historical duplicate deployment keys first: {details}"
+                )
+            try:
+                connection.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                        deployments_idempotency_key_unique
+                    ON deployments (idempotency_key)
+                    """
+                )
+            except sqlite3.IntegrityError as error:
+                raise RuntimeError(
+                    "cannot enforce idempotency-key uniqueness because "
+                    "historical duplicate deployment keys exist"
+                ) from error
 
-    def submit(self, idempotency_key: str, payload: dict[str, Any]) -> str:
-        """Starter behavior: incorrectly creates a new deployment every time."""
-        run_id = str(uuid.uuid4())
+    def _validate_request(
+        self,
+        idempotency_key: str,
+        payload: dict[str, Any],
+    ) -> None:
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            raise RequestValidationError(
+                "idempotency_key must be a non-empty string"
+            )
+        if not isinstance(payload, dict):
+            raise RequestValidationError("payload must be an object")
+        if payload.get("destination") != "hubspot-marketing":
+            raise RequestValidationError(
+                "destination must be 'hubspot-marketing'"
+            )
+        if payload.get("mode") != "draft":
+            raise RequestValidationError("mode must be 'draft'")
+
+        assets = payload.get("assets")
+        if not isinstance(assets, list):
+            raise RequestValidationError("assets must be an explicit list")
+
+        seen_asset_ids: set[str] = set()
+        required_fields = (
+            "asset_id",
+            "source_sha256",
+            "type",
+            "display_name",
+        )
+        for index, asset in enumerate(assets):
+            if not isinstance(asset, dict):
+                raise RequestValidationError(f"asset {index} must be an object")
+            for field in required_fields:
+                value = asset.get(field)
+                if not isinstance(value, str) or not value.strip():
+                    raise RequestValidationError(
+                        f"asset {index} field {field!r} must be a non-empty string"
+                    )
+
+            asset_id = asset["asset_id"]
+            if asset_id in seen_asset_ids:
+                raise RequestValidationError(
+                    f"asset IDs must be unique; duplicate {asset_id!r}"
+                )
+            seen_asset_ids.add(asset_id)
+
+            display_name = asset["display_name"]
+            stored_name = display_name.strip()[: FakeHubSpot.DISPLAY_NAME_LIMIT]
+            if display_name != stored_name:
+                raise RequestValidationError(
+                    f"asset {asset_id!r} display_name must already satisfy "
+                    f"the provider's {FakeHubSpot.DISPLAY_NAME_LIMIT}-character "
+                    "limit and whitespace rules"
+                )
+
+    def submit(
+        self,
+        idempotency_key: str,
+        payload: dict[str, Any],
+    ) -> SubmissionResult:
+        self._validate_request(idempotency_key, payload)
         payload_json = _canonical_json(payload)
         payload_hash = _digest_text(payload_json)
+        run_id = str(uuid.uuid4())
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT id, payload_hash
+                FROM deployments
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+            matching_rows = connection.execute(
+                """
+                SELECT id
+                FROM deployments
+                WHERE payload_hash = ? AND idempotency_key <> ?
+                ORDER BY rowid
+                """,
+                (payload_hash, idempotency_key),
+            ).fetchall()
+            matching_run_ids = tuple(str(row["id"]) for row in matching_rows)
+            if existing is not None:
+                if existing["payload_hash"] != payload_hash:
+                    raise IdempotencyConflict(
+                        f"idempotency key {idempotency_key!r} is already bound "
+                        "to a different payload"
+                    )
+                return SubmissionResult(
+                    run_id=str(existing["id"]),
+                    replayed=True,
+                    matching_payload_run_ids=matching_run_ids,
+                )
             connection.execute(
                 """
                 INSERT INTO deployments
@@ -126,7 +258,11 @@ class Relay:
                 """,
                 (run_id, idempotency_key, payload_hash, payload_json),
             )
-        return run_id
+        return SubmissionResult(
+            run_id=run_id,
+            replayed=False,
+            matching_payload_run_ids=matching_run_ids,
+        )
 
     def get(self, run_id: str) -> dict[str, Any]:
         with self._connect() as connection:
@@ -152,29 +288,26 @@ class Relay:
             )
 
     def retry(self, run_id: str) -> str:
-        """The admin panel's retry button for a deployment operators call stuck.
-
-        Starter behavior: re-runs the same approved request under a fresh
-        deployment, keeping the operator's original idempotency key.
-        """
-        previous = self.get(run_id)
-        new_run_id = str(uuid.uuid4())
-        payload_json = _canonical_json(previous["payload"])
+        """Return the same logical run, requeuing only unfinished work."""
         with self._connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
-                INSERT INTO deployments
-                    (id, idempotency_key, payload_hash, payload_json, status)
-                VALUES (?, ?, ?, ?, 'pending')
+                UPDATE deployments
+                SET status = 'pending'
+                WHERE id = ? AND status = 'running'
                 """,
-                (
-                    new_run_id,
-                    str(previous["idempotency_key"]),
-                    str(previous["payload_hash"]),
-                    payload_json,
-                ),
+                (run_id,),
             )
-        return new_run_id
+            if cursor.rowcount == 0:
+                row = connection.execute(
+                    "SELECT status FROM deployments WHERE id = ?",
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(run_id)
+                if row["status"] == "cancelled":
+                    raise RunCancelled(run_id)
+        return run_id
 
     def run_once(
         self,

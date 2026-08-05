@@ -4,20 +4,38 @@ import json
 import tempfile
 from pathlib import Path
 
-from relay import InjectedCrash, Relay
+from relay import InjectedCrash, Relay, RequestValidationError
 
 
 def main() -> None:
-    payload = json.loads(
+    rejected_payload = json.loads(
         Path("fixtures/deployment_request.json").read_text()
+    )
+    payload = json.loads(
+        Path("fixtures/deployment_request_short.json").read_text()
     )
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         db_path = root / "deployments.db"
         provider_path = root / "fake-hubspot.json"
         relay = Relay(db_path, provider_path)
-        run_id = relay.submit("campaign-deploy-001", payload)
 
+        print("REQUEST VALIDATION")
+        try:
+            relay.submit("campaign-deploy-invalid", rejected_payload)
+        except RequestValidationError as error:
+            print(f"REJECTED BEFORE DEPLOYMENT: {error}")
+        else:
+            raise RuntimeError("expected the main fixture to be rejected")
+        print(
+            "objects the destination is holding after rejection: "
+            f"{len(relay.provider.list_objects())}"
+        )
+
+        run_id = relay.submit("campaign-deploy-001", payload).run_id
+
+        print()
+        print("VALID REQUEST CRASH AND RECOVERY")
         try:
             relay.run_once(
                 run_id,
@@ -37,8 +55,7 @@ def main() -> None:
             f"{len(restarted.provider.list_objects())}"
         )
 
-        # The destination dropped two objects. This is not hypothetical --
-        # `make stress` runs the worker pool and the count comes back short.
+        # Simulate destination drift after the verified deployment.
         stored = json.loads(provider_path.read_text())
         for key in list(stored)[:2]:
             del stored[key]

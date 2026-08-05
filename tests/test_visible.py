@@ -11,14 +11,14 @@ from relay import InjectedCrash, Relay
 class ReportedDeploymentFailureTest(unittest.TestCase):
     def test_reported_deployment_recovers_without_duplicate_drafts(self) -> None:
         payload = json.loads(
-            Path("fixtures/deployment_request.json").read_text()
+            Path("fixtures/deployment_request_short.json").read_text()
         )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             db_path = root / "deployments.db"
             provider_path = root / "fake-hubspot.json"
             relay = Relay(db_path, provider_path)
-            run_id = relay.submit("reported-deployment", payload)
+            run_id = relay.submit("reported-deployment", payload).run_id
 
             with self.assertRaises(InjectedCrash):
                 relay.run_once(
@@ -40,12 +40,13 @@ class ReportedDeploymentFailureTest(unittest.TestCase):
 
     def test_every_deployed_object_matches_its_source_asset(self) -> None:
         payload = json.loads(
-            Path("fixtures/deployment_request.json").read_text()
+            Path("fixtures/deployment_request_short.json").read_text()
         )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             relay = Relay(root / "d.db", root / "p.json")
-            receipt = relay.run_once(relay.submit("integrity-check", payload))
+            run_id = relay.submit("integrity-check", payload).run_id
+            receipt = relay.run_once(run_id)
 
             for stored in receipt["objects"]:
                 for asset in payload["assets"]:

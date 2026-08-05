@@ -3,7 +3,9 @@ from .core import (
     IdempotencyConflict,
     InjectedCrash,
     Relay,
+    RequestValidationError,
     RunCancelled,
+    SubmissionResult,
 )
 
 __all__ = [
@@ -11,5 +13,7 @@ __all__ = [
     "IdempotencyConflict",
     "InjectedCrash",
     "Relay",
+    "RequestValidationError",
     "RunCancelled",
+    "SubmissionResult",
 ]

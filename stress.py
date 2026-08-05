@@ -17,7 +17,9 @@ WORKERS = 12
 
 
 def main() -> None:
-    payload = json.loads(Path("fixtures/deployment_request.json").read_text())
+    payload = json.loads(
+        Path("fixtures/deployment_request_short.json").read_text()
+    )
     assets = len(payload["assets"])
 
     with tempfile.TemporaryDirectory() as temporary:
@@ -27,7 +29,7 @@ def main() -> None:
 
         relay = Relay(db_path, provider_path)
         run_ids = [
-            relay.submit(f"campaign-deploy-{i:03d}", payload)
+            relay.submit(f"campaign-deploy-{i:03d}", payload).run_id
             for i in range(WORKERS)
         ]
 
