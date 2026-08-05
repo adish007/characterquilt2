@@ -1,10 +1,13 @@
 # Decisions
 
-- Time actually spent: not continuously recorded; work was delivered and verified in seven numbered boundaries, with Steps 5–7 combined under the final timebox.
-- Roadmap changes: case interpretation was completed separately. Implementation kept the planned request identity, claims, provider gate, reconciliation, cancellation, and process-stress design. Final documentation and mutation work were narrowed to the load-bearing checks already in the suite.
-- Agent use and overrides: parallel agents implemented bounded core/test/demo slices. The primary agent re-ran every suite, corrected lease-expiry tests, provider-constructor schedules, duplicate reconciliation, failure precedence, receipt independence, and cancellation boundaries before committing.
-- Operator promise: validated immutable requests; one stable run per key; fenced expiring ownership; relay-owned provider calls serialized across processes; exact request-derived reconciliation before `done`; fresh live audit; visible retryable/failed partial outcomes; and cancellation that reports accepted in-flight effects without relabelling completed work.
-- First failing checks: request identity/validation in `test_request_contract.py`; claim ownership in `test_run_claims.py`; cross-process serialization in `test_provider_coordination.py`; provider truth in `test_reconciliation.py`; cancellation in `test_cancellation.py`; end-to-end process accounting in `make stress`.
-- Cause fixes: SQLite uniqueness/claims remove duplicate logical ownership; the POSIX gate removes relay-caused torn/lost provider writes; exact reconciliation removes asserted success. Live audit detects but cannot prevent later provider drift. Cancellation reports rather than rolls back accepted effects.
-- Still unsafe: no atomic SQLite/provider transaction or rollback; provider crashes inside its own persistence can still damage state; advisory locking covers cooperating relay processes only; arbitrary replacement by another usable unique provider `object_id` is not distinguishable from request truth; historical duplicate/partial drafts are not cleaned up; non-POSIX hosts are unsupported.
-- Next injected failure: kill the provider midway through persistence, then prove recovery remains visibly retryable until readable state or operator repair resolves it.
+Short notes are fine. Fill this in before you submit.
+
+- Time actually spent:
+- What changed between your roadmap and what you shipped:
+- What you had the coding agent do, and where you overrode it:
+- What your implementation actually promises an operator:
+- For each promise, the check that fails first if it stops holding:
+- What you fixed at the cause, and what you only stopped from showing:
+- What is still unsafe, including anything that came up during the session and
+  stayed open:
+- The next failure you would inject:
