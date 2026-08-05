@@ -7,6 +7,7 @@ import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +41,14 @@ class RequestContractTest(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.db_path = self.root / "deployments.db"
         self.provider_path = self.root / "provider.json"
-        self.relay = Relay(self.db_path, self.provider_path)
+        self.now = 1_000.0
+        self.claim_ttl = 10.0
+        self.relay = Relay(
+            self.db_path,
+            self.provider_path,
+            clock=lambda: self.now,
+            claim_ttl_seconds=self.claim_ttl,
+        )
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -51,7 +59,7 @@ class RequestContractTest(unittest.TestCase):
         if idempotency_key is not None:
             query += " WHERE idempotency_key = ?"
             parameters = (idempotency_key,)
-        with sqlite3.connect(self.db_path) as connection:
+        with closing(sqlite3.connect(self.db_path)) as connection, connection:
             return int(connection.execute(query, parameters).fetchone()[0])
 
     def assert_rejected_without_effects(
@@ -275,6 +283,7 @@ class RequestContractTest(unittest.TestCase):
             )
 
         self.assertEqual(self.relay.get(submission.run_id)["status"], "running")
+        self.now += self.claim_ttl
         self.assertEqual(self.relay.retry(submission.run_id), submission.run_id)
         self.assertEqual(self.relay.get(submission.run_id)["status"], "pending")
         self.relay.run_once(submission.run_id)
@@ -338,7 +347,7 @@ class RequestContractTest(unittest.TestCase):
         legacy_db = self.root / "legacy.db"
         legacy_provider = self.root / "legacy-provider.json"
         payload_json = json.dumps(valid_payload(), sort_keys=True)
-        with sqlite3.connect(legacy_db) as connection:
+        with closing(sqlite3.connect(legacy_db)) as connection, connection:
             connection.execute(
                 """
                 CREATE TABLE deployments (

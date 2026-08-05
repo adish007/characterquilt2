@@ -17,7 +17,14 @@ class ReportedDeploymentFailureTest(unittest.TestCase):
             root = Path(temporary)
             db_path = root / "deployments.db"
             provider_path = root / "fake-hubspot.json"
-            relay = Relay(db_path, provider_path)
+            now = [1_000.0]
+            claim_ttl = 10.0
+            relay = Relay(
+                db_path,
+                provider_path,
+                clock=lambda: now[0],
+                claim_ttl_seconds=claim_ttl,
+            )
             run_id = relay.submit("reported-deployment", payload).run_id
 
             with self.assertRaises(InjectedCrash):
@@ -26,7 +33,13 @@ class ReportedDeploymentFailureTest(unittest.TestCase):
                     crash_at="after_first_provider_write",
                 )
 
-            restarted = Relay(db_path, provider_path)
+            now[0] += claim_ttl
+            restarted = Relay(
+                db_path,
+                provider_path,
+                clock=lambda: now[0],
+                claim_ttl_seconds=claim_ttl,
+            )
             restarted.recover()
 
             state = restarted.get(run_id)

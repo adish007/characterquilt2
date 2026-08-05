@@ -18,7 +18,14 @@ def main() -> None:
         root = Path(temporary)
         db_path = root / "deployments.db"
         provider_path = root / "fake-hubspot.json"
-        relay = Relay(db_path, provider_path)
+        now = [1_000.0]
+        claim_ttl = 10.0
+        relay = Relay(
+            db_path,
+            provider_path,
+            clock=lambda: now[0],
+            claim_ttl_seconds=claim_ttl,
+        )
 
         print("REQUEST VALIDATION")
         try:
@@ -44,7 +51,18 @@ def main() -> None:
         except InjectedCrash as error:
             print(f"INJECTED CRASH: {error}")
 
-        restarted = Relay(db_path, provider_path)
+        restarted = Relay(
+            db_path,
+            provider_path,
+            clock=lambda: now[0],
+            claim_ttl_seconds=claim_ttl,
+        )
+        restarted.recover()
+        print(
+            "status while the crashed worker's claim is active: "
+            f"{restarted.get(run_id)['status']}"
+        )
+        now[0] += claim_ttl
         restarted.recover()
         print("DEPLOYMENT SUMMARY")
         print(json.dumps(restarted.deployment_summary(run_id), indent=2))

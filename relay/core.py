@@ -3,10 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 class InjectedCrash(RuntimeError):
@@ -23,6 +24,24 @@ class RequestValidationError(ValueError):
 
 class RunCancelled(RuntimeError):
     pass
+
+
+class RunClaimed(RuntimeError):
+    pass
+
+
+class ClaimLost(RuntimeError):
+    pass
+
+
+class _ClosingConnection(sqlite3.Connection):
+    """Make ``with self._connect()`` close as well as transact."""
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool:
+        try:
+            return bool(super().__exit__(exc_type, exc_value, traceback))
+        finally:
+            self.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,18 +118,33 @@ class FakeHubSpot:
 
 
 class Relay:
-    def __init__(self, db_path: Path, provider_state_path: Path) -> None:
+    def __init__(
+        self,
+        db_path: Path,
+        provider_state_path: Path,
+        *,
+        clock: Callable[[], float] | None = None,
+        claim_ttl_seconds: float = 30.0,
+    ) -> None:
+        if claim_ttl_seconds <= 0:
+            raise ValueError("claim_ttl_seconds must be positive")
         self.db_path = Path(db_path)
         self.provider = FakeHubSpot(provider_state_path)
+        self._clock = clock or time.time
+        self.claim_ttl_seconds = float(claim_ttl_seconds)
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path)
+        connection = sqlite3.connect(
+            self.db_path,
+            factory=_ClosingConnection,
+        )
         connection.row_factory = sqlite3.Row
         return connection
 
     def _init_db(self) -> None:
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS deployments (
@@ -123,6 +157,21 @@ class Relay:
                 )
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(deployments)"
+                ).fetchall()
+            }
+            for name, column_type in (
+                ("error_json", "TEXT"),
+                ("claim_token", "TEXT"),
+                ("claim_expires_at", "REAL"),
+            ):
+                if name not in columns:
+                    connection.execute(
+                        f"ALTER TABLE deployments ADD COLUMN {name} {column_type}"
+                    )
             duplicate_keys = connection.execute(
                 """
                 SELECT idempotency_key, COUNT(*) AS uses
@@ -278,6 +327,11 @@ class Relay:
         result["receipt"] = (
             json.loads(receipt_json) if receipt_json is not None else None
         )
+        error_json = result.pop("error_json")
+        result["error"] = (
+            json.loads(error_json) if error_json is not None else None
+        )
+        result.pop("claim_token")
         return result
 
     def cancel(self, run_id: str) -> None:
@@ -290,24 +344,121 @@ class Relay:
     def retry(self, run_id: str) -> str:
         """Return the same logical run, requeuing only unfinished work."""
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT status, claim_token, claim_expires_at
+                FROM deployments
+                WHERE id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(run_id)
+
+            status = str(row["status"])
+            if status == "done":
+                return run_id
+            if status == "cancelled":
+                raise RunCancelled(run_id)
+            if status == "failed":
+                raise RuntimeError(f"run {run_id!r} is terminally failed")
+
+            now = float(self._clock())
+            claim_is_active = (
+                status == "running"
+                and row["claim_token"] is not None
+                and row["claim_expires_at"] is not None
+                and float(row["claim_expires_at"]) > now
+            )
+            if claim_is_active:
+                raise RunClaimed(f"run {run_id!r} has an active claim")
+            if status not in {"pending", "retryable", "running"}:
+                raise RuntimeError(
+                    f"run {run_id!r} in state {status!r} cannot be retried"
+                )
+
             cursor = connection.execute(
                 """
                 UPDATE deployments
-                SET status = 'pending'
-                WHERE id = ? AND status = 'running'
+                SET status = 'pending', claim_token = NULL,
+                    claim_expires_at = NULL
+                WHERE id = ?
                 """,
                 (run_id,),
             )
-            if cursor.rowcount == 0:
-                row = connection.execute(
-                    "SELECT status FROM deployments WHERE id = ?",
-                    (run_id,),
-                ).fetchone()
-                if row is None:
-                    raise KeyError(run_id)
-                if row["status"] == "cancelled":
-                    raise RunCancelled(run_id)
+            if cursor.rowcount != 1:
+                raise RuntimeError(f"failed to requeue run {run_id!r}")
         return run_id
+
+    def _renew_claim(self, run_id: str, claim_token: str) -> None:
+        now = float(self._clock())
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE deployments
+                SET claim_expires_at = ?
+                WHERE id = ? AND status = 'running'
+                    AND claim_token = ? AND claim_expires_at > ?
+                """,
+                (
+                    now + self.claim_ttl_seconds,
+                    run_id,
+                    claim_token,
+                    now,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ClaimLost(f"claim for run {run_id!r} is no longer active")
+
+    def _mark_retryable(
+        self,
+        run_id: str,
+        claim_token: str,
+        error: Exception,
+    ) -> None:
+        now = float(self._clock())
+        error_json = _canonical_json(
+            {
+                "type": type(error).__name__,
+                "message": str(error),
+                "retryable": True,
+            }
+        )
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE deployments
+                SET status = 'retryable', error_json = ?,
+                    claim_token = NULL, claim_expires_at = NULL
+                WHERE id = ? AND status = 'running'
+                    AND claim_token = ? AND claim_expires_at > ?
+                """,
+                (error_json, run_id, claim_token, now),
+            )
+            if cursor.rowcount != 1:
+                raise ClaimLost(f"claim for run {run_id!r} is no longer active")
+
+    def _complete(
+        self,
+        run_id: str,
+        claim_token: str,
+        receipt: dict[str, Any],
+    ) -> None:
+        now = float(self._clock())
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE deployments
+                SET status = 'done', receipt_json = ?, error_json = NULL,
+                    claim_token = NULL, claim_expires_at = NULL
+                WHERE id = ? AND status = 'running'
+                    AND claim_token = ? AND claim_expires_at > ?
+                """,
+                (_canonical_json(receipt), run_id, claim_token, now),
+            )
+            if cursor.rowcount != 1:
+                raise ClaimLost(f"claim for run {run_id!r} is no longer active")
 
     def run_once(
         self,
@@ -315,42 +466,106 @@ class Relay:
         *,
         crash_at: str | None = None,
     ) -> dict[str, Any]:
-        run = self.get(run_id)
+        claim_token = str(uuid.uuid4())
+        now = float(self._clock())
         with self._connect() as connection:
-            connection.execute(
-                "UPDATE deployments SET status = 'running' WHERE id = ?",
-                (run_id,),
-            )
-
-        readbacks: list[dict[str, str]] = []
-        for index, asset in enumerate(run["payload"]["assets"]):
-            external_key = f"{run_id}:{asset['asset_id']}"
-            self.provider.create_draft(
-                external_key=external_key,
-                asset=asset,
-            )
-            if crash_at == "after_first_provider_write" and index == 0:
-                raise InjectedCrash(
-                    "crashed after provider write and before local receipt"
-                )
-            readbacks.append(self.provider.read(external_key))
-
-        receipt = {
-            "run_id": run_id,
-            "payload_sha256": run["payload_hash"],
-            "objects": readbacks,
-            "verified": True,
-        }
-        with self._connect() as connection:
-            connection.execute(
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
                 """
-                UPDATE deployments
-                SET status = 'done', receipt_json = ?
+                SELECT status, receipt_json, claim_token, claim_expires_at
+                FROM deployments
                 WHERE id = ?
                 """,
-                (_canonical_json(receipt), run_id),
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(run_id)
+
+            status = str(row["status"])
+            if status == "done":
+                if row["receipt_json"] is None:
+                    raise RuntimeError(f"done run {run_id!r} has no receipt")
+                return json.loads(str(row["receipt_json"]))
+            if status == "cancelled":
+                raise RunCancelled(run_id)
+            if status == "failed":
+                raise RuntimeError(f"run {run_id!r} is terminally failed")
+
+            claim_is_active = (
+                status == "running"
+                and row["claim_token"] is not None
+                and row["claim_expires_at"] is not None
+                and float(row["claim_expires_at"]) > now
             )
-        return receipt
+            if claim_is_active:
+                raise RunClaimed(f"run {run_id!r} has an active claim")
+            if status not in {"pending", "retryable", "running"}:
+                raise RuntimeError(
+                    f"run {run_id!r} in state {status!r} cannot be executed"
+                )
+
+            cursor = connection.execute(
+                """
+                UPDATE deployments
+                SET status = 'running', claim_token = ?, claim_expires_at = ?
+                WHERE id = ?
+                    AND (
+                        status IN ('pending', 'retryable')
+                        OR (
+                            status = 'running'
+                            AND (
+                                claim_token IS NULL
+                                OR claim_expires_at IS NULL
+                                OR claim_expires_at <= ?
+                            )
+                        )
+                    )
+                """,
+                (
+                    claim_token,
+                    now + self.claim_ttl_seconds,
+                    run_id,
+                    now,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RunClaimed(f"run {run_id!r} could not be claimed")
+
+        try:
+            run = self.get(run_id)
+            readbacks: list[dict[str, str]] = []
+            for index, asset in enumerate(run["payload"]["assets"]):
+                external_key = f"{run_id}:{asset['asset_id']}"
+                self._renew_claim(run_id, claim_token)
+                self.provider.create_draft(
+                    external_key=external_key,
+                    asset=asset,
+                )
+                if crash_at == "after_first_provider_write" and index == 0:
+                    raise InjectedCrash(
+                        "crashed after provider write and before local receipt"
+                    )
+                self._renew_claim(run_id, claim_token)
+                readbacks.append(self.provider.read(external_key))
+
+            receipt = {
+                "run_id": run_id,
+                "payload_sha256": run["payload_hash"],
+                "objects": readbacks,
+                "verified": True,
+            }
+            self._complete(run_id, claim_token, receipt)
+            return receipt
+        except InjectedCrash:
+            raise
+        except ClaimLost:
+            raise
+        except Exception as error:
+            try:
+                self._mark_retryable(run_id, claim_token, error)
+            except ClaimLost as claim_error:
+                raise claim_error from error
+            raise
 
     def deployment_summary(self, run_id: str) -> dict[str, Any]:
         """Operator-facing summary of what a deployment did.
@@ -367,6 +582,7 @@ class Relay:
             "objects_deployed": len(objects),
             "verified": bool(receipt.get("verified")),
             "assets_approved": len(run["payload"].get("assets", [])),
+            "error": run.get("error"),
         }
 
     def audit(self, run_id: str) -> dict[str, Any]:
@@ -386,14 +602,28 @@ class Relay:
         }
 
     def recover(self) -> None:
-        """
-        Starter behavior: enough recovery for the happy-path demo.
-
-        Operator evidence reports other cases that this does not make safe.
-        """
+        """Attempt each currently eligible run without blocking later work."""
+        now = float(self._clock())
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT id FROM deployments WHERE status = 'running'"
+                """
+                SELECT id
+                FROM deployments
+                WHERE status IN ('pending', 'retryable')
+                    OR (
+                        status = 'running'
+                        AND (
+                            claim_token IS NULL
+                            OR claim_expires_at IS NULL
+                            OR claim_expires_at <= ?
+                        )
+                    )
+                ORDER BY rowid
+                """,
+                (now,),
             ).fetchall()
         for row in rows:
-            self.run_once(str(row["id"]))
+            try:
+                self.run_once(str(row["id"]))
+            except Exception:
+                continue
