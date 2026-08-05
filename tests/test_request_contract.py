@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
+import multiprocessing
 import sqlite3
 import tempfile
 import threading
@@ -19,6 +21,30 @@ from relay import (
 )
 
 
+def submit_from_process(
+    db_path: str,
+    provider_path: str,
+    key: str,
+    payload: dict[str, Any],
+    ready: Any,
+    start: Any,
+    results: Any,
+) -> None:
+    ready_sent = False
+    try:
+        relay = Relay(Path(db_path), Path(provider_path))
+        ready.put(True)
+        ready_sent = True
+        if not start.wait(timeout=30):
+            raise TimeoutError("submission start was not released")
+        submission = relay.submit(key, payload)
+        results.put(("ok", submission.run_id, submission.replayed))
+    except BaseException as error:
+        if not ready_sent:
+            ready.put(False)
+        results.put(("error", type(error).__name__, str(error)))
+
+
 def valid_payload(*, asset_count: int = 2) -> dict[str, Any]:
     return {
         "destination": "hubspot-marketing",
@@ -33,6 +59,11 @@ def valid_payload(*, asset_count: int = 2) -> dict[str, Any]:
             for index in range(asset_count)
         ],
     }
+
+
+def canonical_payload(payload: dict[str, Any]) -> tuple[str, str]:
+    payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return payload_json, hashlib.sha256(payload_json.encode()).hexdigest()
 
 
 class RequestContractTest(unittest.TestCase):
@@ -231,6 +262,38 @@ class RequestContractTest(unittest.TestCase):
         self.assertEqual(replay.run_id, first.run_id)
         self.assertEqual(self.deployment_count(idempotency_key=key), 1)
 
+    def test_existing_legacy_binding_is_resolved_before_new_validation(
+        self,
+    ) -> None:
+        payload = json.loads(
+            Path("fixtures/deployment_request.json").read_text()
+        )
+        payload_json, payload_hash = canonical_payload(payload)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            with connection:
+                connection.execute(
+                    """
+                    INSERT INTO deployments
+                        (id, idempotency_key, payload_hash, payload_json, status)
+                    VALUES ('legacy-run', 'legacy-key', ?, ?, 'running')
+                    """,
+                    (payload_hash, payload_json),
+                )
+
+        replay = self.relay.submit("legacy-key", copy.deepcopy(payload))
+
+        self.assertTrue(replay.replayed)
+        self.assertEqual(replay.run_id, "legacy-run")
+        self.assertEqual(self.deployment_count(idempotency_key="legacy-key"), 1)
+
+    def test_changed_invalid_payload_conflicts_with_existing_binding(self) -> None:
+        self.relay.submit("bound-key", valid_payload())
+
+        with self.assertRaises(IdempotencyConflict):
+            self.relay.submit("bound-key", {"assets": "invalid"})
+
+        self.assertEqual(self.deployment_count(idempotency_key="bound-key"), 1)
+
     def test_same_key_with_different_payload_conflicts_without_new_row(self) -> None:
         key = "immutable-request"
         original = valid_payload()
@@ -272,7 +335,7 @@ class RequestContractTest(unittest.TestCase):
             len(payload["assets"]),
         )
 
-    def test_retry_of_stuck_run_requeues_the_same_run(self) -> None:
+    def test_retry_preserves_interrupted_run_for_recovery(self) -> None:
         payload = valid_payload()
         submission = self.relay.submit("retry-stuck", payload)
 
@@ -293,6 +356,45 @@ class RequestContractTest(unittest.TestCase):
             len(self.relay.provider.list_objects()),
             len(payload["assets"]),
         )
+
+    def test_legacy_invalid_run_is_rejected_before_another_provider_write(
+        self,
+    ) -> None:
+        payload = json.loads(
+            Path("fixtures/deployment_request.json").read_text()
+        )
+        payload_json, payload_hash = canonical_payload(payload)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            with connection:
+                connection.execute(
+                    """
+                    INSERT INTO deployments
+                        (id, idempotency_key, payload_hash, payload_json, status)
+                    VALUES (
+                        'legacy-invalid',
+                        'legacy-invalid-key',
+                        ?,
+                        ?,
+                        'running'
+                    )
+                    """,
+                    (payload_hash, payload_json),
+                )
+        first_asset = payload["assets"][0]
+        self.relay.provider.create_draft(
+            external_key=f"legacy-invalid:{first_asset['asset_id']}",
+            asset=first_asset,
+        )
+        provider_before_recovery = self.relay.provider.list_objects()
+
+        with self.assertRaises(RequestValidationError):
+            self.relay.recover()
+
+        self.assertEqual(
+            self.relay.provider.list_objects(),
+            provider_before_recovery,
+        )
+        self.assertEqual(self.relay.get("legacy-invalid")["status"], "running")
 
     def test_concurrent_same_key_submission_creates_one_run(self) -> None:
         worker_count = 6
@@ -318,6 +420,53 @@ class RequestContractTest(unittest.TestCase):
             1,
         )
         self.assertEqual(self.deployment_count(idempotency_key=key), 1)
+
+    def test_processes_submitting_same_key_create_one_run(self) -> None:
+        worker_count = 6
+        context = multiprocessing.get_context("spawn")
+        ready = context.Queue()
+        start = context.Event()
+        results = context.Queue()
+        processes = [
+            context.Process(
+                target=submit_from_process,
+                args=(
+                    str(self.db_path),
+                    str(self.provider_path),
+                    "process-request",
+                    valid_payload(),
+                    ready,
+                    start,
+                    results,
+                ),
+            )
+            for _ in range(worker_count)
+        ]
+        try:
+            for process in processes:
+                process.start()
+            for _ in processes:
+                self.assertTrue(ready.get(timeout=30))
+            start.set()
+            outcomes = [results.get(timeout=30) for _ in processes]
+            for process in processes:
+                process.join(timeout=30)
+                self.assertFalse(process.is_alive())
+                self.assertEqual(process.exitcode, 0)
+        finally:
+            start.set()
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5)
+
+        self.assertTrue(all(outcome[0] == "ok" for outcome in outcomes))
+        self.assertEqual(len({outcome[1] for outcome in outcomes}), 1)
+        self.assertEqual(sum(not outcome[2] for outcome in outcomes), 1)
+        self.assertEqual(
+            self.deployment_count(idempotency_key="process-request"),
+            1,
+        )
 
     def test_concurrent_same_key_different_payloads_choose_one_binding(self) -> None:
         key = "concurrent-conflict"

@@ -233,15 +233,18 @@ class Relay:
                     "historical duplicate deployment keys exist"
                 ) from error
 
+    def _validate_idempotency_key(self, idempotency_key: str) -> None:
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            raise RequestValidationError(
+                "idempotency_key must be a non-empty string"
+            )
+
     def _validate_request(
         self,
         idempotency_key: str,
         payload: dict[str, Any],
     ) -> None:
-        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
-            raise RequestValidationError(
-                "idempotency_key must be a non-empty string"
-            )
+        self._validate_idempotency_key(idempotency_key)
         if not isinstance(payload, dict):
             raise RequestValidationError("payload must be an object")
         if payload.get("destination") != "hubspot-marketing":
@@ -293,8 +296,13 @@ class Relay:
         idempotency_key: str,
         payload: dict[str, Any],
     ) -> SubmissionResult:
-        self._validate_request(idempotency_key, payload)
-        payload_json = _canonical_json(payload)
+        self._validate_idempotency_key(idempotency_key)
+        try:
+            payload_json = _canonical_json(payload)
+        except (TypeError, ValueError) as error:
+            raise RequestValidationError(
+                "payload must be JSON-serializable"
+            ) from error
         payload_hash = _digest_text(payload_json)
         run_id = str(uuid.uuid4())
         with self._connect() as connection:
@@ -328,6 +336,10 @@ class Relay:
                     replayed=True,
                     matching_payload_run_ids=matching_run_ids,
                 )
+            # Existing immutable bindings are resolved above. Validation still
+            # occurs before a new key is reserved, so a corrected request can
+            # reuse a key whose earlier submission was rejected.
+            self._validate_request(idempotency_key, payload)
             connection.execute(
                 """
                 INSERT INTO deployments
@@ -562,6 +574,13 @@ class Relay:
 
         try:
             run = self.get(run_id)
+            # Recheck stored requests at the execution boundary. This prevents
+            # unfinished rows created before preflight validation was
+            # introduced (or rows altered out of band) from bypassing it.
+            self._validate_request(
+                str(run["idempotency_key"]),
+                run["payload"],
+            )
             readbacks: list[dict[str, str]] = []
             for index, asset in enumerate(run["payload"]["assets"]):
                 external_key = f"{run_id}:{asset['asset_id']}"
