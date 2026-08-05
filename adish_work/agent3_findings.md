@@ -112,13 +112,21 @@ summary        -> {'objects_deployed': 4, 'verified': True}
 Deleting the state file outright is handled even more quietly — `Relay()` recreates it as `{}`
 (`core.py:43-44`), so the destination holds nothing and `audit()` still returns `all_present: true`.
 
-**This splits into two non-interchangeable fixes, and conflating them is the trap:**
-- tmp-file + `os.replace` (atomic publish) removes the tearing and the corruption — and removes
-  **none** of the lost updates.
-- an inter-process lock/CAS around load+save removes the lost updates.
+**Corrected — only one fix is available, and it is sufficient.** An earlier version of this section
+recommended tmp-file + `os.replace` alongside a lock. That was wrong on both counts:
 
-Ship only the first and the count is still short. The provider is out of scope to modify, so both
-have to happen *around* it.
+- It is **out of bounds.** `_save` is inside `FakeHubSpot`. `TASK.md`: *"The provider is not yours to
+  change — treat it the way you would treat HubSpot. If you need to simulate how it behaves, do that
+  around it, not inside it."* Atomic publish cannot be done around the provider, only inside it.
+- It is **insufficient anyway.** Atomic replacement stops the tearing and the corrupt-at-rest file,
+  and removes **none** of the lost updates — those come from load-then-save being two operations, not
+  from the write being non-atomic.
+
+The repair that is both in bounds and sufficient is **process-safe serialisation around provider
+operations**: if every load-modify-save runs under one inter-process gate, there is no interleaving
+to tear the file *and* no stale snapshot to lose an update. It must be inter-process — a
+`threading.Lock` looks correct under `make stress`, which is thread-only, and does nothing under the
+multi-process assumption TASK.md sets.
 
 ---
 
@@ -332,7 +340,7 @@ SQLite/WAL. All real, all deterministic, none tied to any operator line or `c` c
 |---|---|---|---|---|
 | 1 | `audit()`/`summary()` never contact the destination | provider wiped → `all_present:true, verified:true, objects_deployed:A` | **CAUSE** of the lie; **not** of the loss — shipped alone it is a better alarm on the same fire | D |
 | 2 | Concurrent writers silently drop each other's objects | 3/20 trials at shipped W=12 reach `W*A`; live stress 5/5 short | CAUSE | A |
-| 3 | State file left permanently unparseable | 13/60 at W=24; 16/24 rows stranded; `recover()` fails forever | CAUSE (of tearing — *not* of #2) | A |
+| 3 | State file left permanently unparseable | 13/60 at W=24; 16/24 rows stranded; `recover()` fails forever | CAUSE — same repair as #2 (one gate removes tearing *and* lost updates); atomic replace is out of bounds and insufficient | A |
 | 4 | `recover()` aborts the whole pass on the first raising row | poison first → 0 of 2 healthy runs deploy, deterministic 3/3 | CAUSE | F |
 | 5 | Cancel does not cancel | 20/20 → `done`, all `A` objects written, audit green | CAUSE | C |
 | 6 | One key → N runs → N×A drafts | 1/2/3/5 submits → 4/8/12/20 objects | CAUSE (needs a UNIQUE index, not SELECT-then-INSERT) | B |
@@ -356,14 +364,16 @@ Deliberate non-fixes to state explicitly: WAL/SQLite locking (§9), a worker lea
 2. **Nobody has measured the operator's literal complaint** — how often `audit()`/`summary()` disagree
    with `provider.list_objects()` across a shipped `make stress` run. That is the cheapest regression
    test available and it does not exist.
-3. **No control baseline.** Nothing has been measured *with* a lock around the provider, so the
-   Cluster A split (atomic publish vs lock) is reasoned from the code, not proven.
+3. **No control baseline.** Nothing has been measured *with* a process-safe gate around the provider.
+   The claim that one gate removes both tearing and lost updates is reasoned from the code, not proven.
 4. **The fixtures cannot distinguish "never wrote" from "wrote then lost."** `recover()` re-creates
    dropped objects and rewrites a byte-identical receipt, leaving no artifact that anything was ever
    missing. `demo.py:40-45` fakes this deterministically; the natural version is indistinguishable
    from a healthy run afterwards.
-5. **`c8`'s provenance is shape-matching, not proof.** The event log has no timestamps, so we cannot
-   show the two `worker_claim` lines and the shortfall are the same episode rather than adjacent facts.
+5. **`c8`'s provenance is shape-matching, not proof.** Both a same-run schedule (one worker saves a
+   stale snapshot and stops — measured 30/30) and cross-run interference reproduce it. With no
+   timestamps the log cannot say which occurred, or whether the two `worker_claim` lines and the
+   shortfall are the same episode. See `Event_Interpretation.md` §3 (c8).
 6. **`c9`'s exact payload is unknown.** `payload_version: "C"` is never defined. I showed the
    *mechanism* is payload-agnostic — any deterministically-failing row blocks everyone behind it —
    which is the honest form of that claim.

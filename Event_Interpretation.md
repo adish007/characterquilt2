@@ -30,7 +30,7 @@ argued as noise.
 | "Once there were fewer, and the receipt still said verified" | c7, c8 | **A + D + E** |
 | "A campaign someone cancelled kept going" | c6 | **C** |
 | "A stuck run seems to take the whole queue down… two campaigns behind it never went out" | c9 | **F** |
-| — no operator complaint — | c1, c10, c11 | baseline / noise |
+| — no operator complaint — | c1 (baseline), c10 (good outcome, but records behaviour the relay lacks), c11 (noise) | — |
 
 ---
 
